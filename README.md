@@ -114,6 +114,34 @@ python -m experiments.manual_contiguous_kv_cache --local-files-only
 该版本有意只支持单请求、单层、无 padding 和固定容量，用来隔离 Cache 的写入顺序、
 有效长度、容量边界及历史前缀不变性；它不是稳定 runtime API。
 
+把 Attention 与 Qwen 的两次 RMSNorm、两条 Residual 和 SwiGLU MLP 组合成完整第 0
+个 Decoder Layer，并逐检查点对拍：
+
+```bash
+python -m experiments.manual_qwen_decoder_layer --local-files-only
+```
+
+最后将同一套手写层逻辑堆叠 24 次，加上 Embedding、Final RMSNorm 和 tied LM Head，
+形成只支持无 padding Prefill 的完整教学版 ModelRunner：
+
+```bash
+python -m experiments.manual_qwen_model_runner --local-files-only
+```
+
+将配置和权重映射提升到稳定 `src/` 后，可运行不持有 Hugging Face 模块对象的
+`QwenPrefillRunner` 集成对拍：
+
+```bash
+python -m experiments.independent_qwen_model_runner --local-files-only
+```
+
+最后绕过 `AutoModelForCausalLM`，直接从 `config.json` 和单文件/分片 safetensors
+构造 Candidate；实验会先释放 HF Reference，再加载自有 Runner，适合 6 GB GPU：
+
+```bash
+python -m experiments.direct_safetensors_runner --local-files-only
+```
+
 ## 目录
 
 ```text
