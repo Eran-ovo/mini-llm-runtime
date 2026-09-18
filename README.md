@@ -4,7 +4,8 @@
 `Qwen/Qwen2.5-0.5B`，主线是从可信的 Hugging Face reference 出发，逐步实现
 ModelRunner、KV Cache、Paged Attention 和 Continuous Batching。
 
-当前里程碑：**v0.1 correctness baseline（第一小步）**。
+当前里程碑：**v0.3 连续 KV Cache**。已具备独立权重加载、Qwen ModelRunner、
+Prefill、单 token Decode、单请求 greedy generation，以及有/无 Cache 的正式 benchmark。
 
 ## 架构主线
 
@@ -141,6 +142,53 @@ python -m experiments.independent_qwen_model_runner --local-files-only
 ```bash
 python -m experiments.direct_safetensors_runner --local-files-only
 ```
+
+## 连续 KV Cache
+
+v0.3 从稳定的多层连续 Cache 数据结构开始。它预分配
+`[layer, batch, kv_head, capacity, head_dim]` 的 K/V buffer，并用
+`begin_append → write_layer → commit_append` 保证 24 层全部写完后才推进全局长度。
+当前实现固定 batch、等长请求，并已接入 ModelRunner 的 Prefill 与单 token Decode。
+
+Prefill 集成实验会在 24 层中逐层写入旋转后的 K 和原始 V，并与 Hugging Face
+`past_key_values` 对拍：
+
+```bash
+python -m experiments.prefill_kv_cache_runner --local-files-only
+```
+
+单 token Decode 会使用追加前的 Cache 长度作为 RoPE position，只计算当前 token 的
+Q/K/V，再让当前 Q 读取完整历史 K/V。下面的实验与 Hugging Face 对拍增长后的 24 层
+Cache 和 Decode logits：
+
+```bash
+python -m experiments.decode_kv_cache_runner --local-files-only
+```
+
+在此基础上，`greedy_generate` 用一次 Prefill 和最多 `max_new_tokens - 1` 次
+Decode 组成完整的单请求生成循环，并处理 EOS、最大位置与 Cache 容量。逐 step
+logits 和最终 token 序列可用下面的真实模型实验对拍：
+
+```bash
+python -m experiments.greedy_generation_runner \
+  --max-new-tokens 8 \
+  --local-files-only
+```
+
+正式比较“每步完整重算”和“连续 KV Cache”的固定长度生成路径：
+
+```bash
+python scripts/benchmark_kv_cache.py \
+  --max-new-tokens 16 \
+  --warmup 5 \
+  --repeats 20 \
+  --local-files-only \
+  --output-dir benchmarks/results/kv_cache_v03
+```
+
+两条路径按轮交错，并在奇偶轮反转先后次序，以降低 Laptop GPU 温度、频率和功耗
+漂移造成的顺序偏差。结果目录包含保存全部 latency/memory 原始样本与环境信息的
+`result.json`，以及便于阅读的 `report.md`。
 
 ## 目录
 

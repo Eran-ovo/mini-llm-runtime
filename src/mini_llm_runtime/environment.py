@@ -65,7 +65,8 @@ def collect_environment(repo_root: Path | None = None) -> dict[str, Any]:
 
     smi_query = [
         "nvidia-smi",
-        "--query-gpu=name,driver_version,memory.total,memory.free,memory.used,pstate,power.limit",
+        "--query-gpu=name,driver_version,memory.total,memory.free,memory.used,"
+        "pstate,temperature.gpu,clocks.sm,clocks.mem,power.draw,power.limit",
         "--format=csv,noheader,nounits",
     ]
     data["nvidia_smi"] = _run(smi_query)

@@ -1,6 +1,10 @@
 import pytest
 
-from mini_llm_runtime.timing import summarize_samples
+from mini_llm_runtime.timing import (
+    CudaBenchmarkCase,
+    measure_cuda_interleaved,
+    summarize_samples,
+)
 
 
 def test_summary_keeps_raw_samples_and_uses_median() -> None:
@@ -15,3 +19,10 @@ def test_summary_rejects_empty_samples() -> None:
     with pytest.raises(ValueError, match="至少需要"):
         summarize_samples([], warmup=0)
 
+
+def test_interleaved_measurement_validates_cases_before_cuda() -> None:
+    case = CudaBenchmarkCase(operation=lambda _: None)
+    with pytest.raises(ValueError, match="至少需要两个"):
+        measure_cuda_interleaved({"only": case})
+    with pytest.raises(ValueError, match="name 不能为空"):
+        measure_cuda_interleaved({"": case, "valid": case})

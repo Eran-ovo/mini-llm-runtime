@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import statistics
 from dataclasses import asdict, dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import torch
 
@@ -20,6 +20,14 @@ class TimingResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class CudaBenchmarkCase:
+    """一条待计时路径，以及在 Event 区间外重建输入状态的函数。"""
+
+    operation: Callable[[Any], Any]
+    prepare: Callable[[], Any] | None = None
 
 
 def summarize_samples(samples_ms: list[float], warmup: int) -> TimingResult:
@@ -49,32 +57,18 @@ def measure_cuda(
     """测量 operation；prepare 在 Event 计时区间外运行，适合重建 Decode cache。"""
     if warmup < 0 or repeats <= 0:
         raise ValueError("warmup 必须 >= 0 且 repeats 必须 > 0")
-    device = torch.device(device)
-    if device.type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("measure_cuda 只接受当前可用的 CUDA device")
-
-    def one(measure: bool) -> tuple[float, int]:
-        context = prepare() if prepare is not None else None
-        torch.cuda.synchronize(device)
-        if measure:
-            torch.cuda.reset_peak_memory_stats(device)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        operation(context)
-        end.record()
-        end.synchronize()
-        elapsed = float(start.elapsed_time(end))
-        peak = int(torch.cuda.max_memory_allocated(device)) if measure else 0
-        return elapsed, peak
+    device = _validate_cuda_device(device)
+    case = CudaBenchmarkCase(operation=operation, prepare=prepare)
 
     for _ in range(warmup):
-        one(measure=False)
+        _measure_cuda_once(case, device=device, measure_memory=False)
 
     samples: list[float] = []
     memory_samples: list[int] = []
     for _ in range(repeats):
-        elapsed, peak = one(measure=True)
+        elapsed, peak = _measure_cuda_once(
+            case, device=device, measure_memory=True
+        )
         samples.append(elapsed)
         memory_samples.append(peak)
 
@@ -87,3 +81,80 @@ def measure_cuda(
         peak_memory_samples_bytes=memory_samples,
     )
 
+
+def measure_cuda_interleaved(
+    cases: Mapping[str, CudaBenchmarkCase],
+    *,
+    warmup: int = 2,
+    repeats: int = 10,
+    device: torch.device | str = "cuda",
+) -> dict[str, TimingResult]:
+    """交错测量多条路径，奇偶轮反转顺序以减轻温度/频率漂移偏差。"""
+    if warmup < 0 or repeats <= 0:
+        raise ValueError("warmup 必须 >= 0 且 repeats 必须 > 0")
+    if len(cases) < 2:
+        raise ValueError("interleaved benchmark 至少需要两个 case")
+    if any(not name for name in cases):
+        raise ValueError("benchmark case name 不能为空")
+    device = _validate_cuda_device(device)
+    names = list(cases)
+
+    def order_for(round_index: int) -> list[str]:
+        return names if round_index % 2 == 0 else list(reversed(names))
+
+    for round_index in range(warmup):
+        for name in order_for(round_index):
+            _measure_cuda_once(
+                cases[name], device=device, measure_memory=False
+            )
+
+    samples = {name: [] for name in names}
+    memory_samples = {name: [] for name in names}
+    for round_index in range(repeats):
+        for name in order_for(round_index):
+            elapsed, peak = _measure_cuda_once(
+                cases[name], device=device, measure_memory=True
+            )
+            samples[name].append(elapsed)
+            memory_samples[name].append(peak)
+
+    return {
+        name: TimingResult(
+            warmup=warmup,
+            repeats=repeats,
+            samples_ms=samples[name],
+            median_ms=float(statistics.median(samples[name])),
+            peak_memory_bytes=max(memory_samples[name]),
+            peak_memory_samples_bytes=memory_samples[name],
+        )
+        for name in names
+    }
+
+
+def _validate_cuda_device(device: torch.device | str) -> torch.device:
+    resolved = torch.device(device)
+    if resolved.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("CUDA benchmark 只接受当前可用的 CUDA device")
+    return resolved
+
+
+def _measure_cuda_once(
+    case: CudaBenchmarkCase,
+    *,
+    device: torch.device,
+    measure_memory: bool,
+) -> tuple[float, int]:
+    context = case.prepare() if case.prepare is not None else None
+    torch.cuda.synchronize(device)
+    if measure_memory:
+        # reset 后的 peak 会从当前 live allocation 起算，因此包含模型与准备好的 Cache。
+        torch.cuda.reset_peak_memory_stats(device)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    case.operation(context)
+    end.record()
+    end.synchronize()
+    elapsed = float(start.elapsed_time(end))
+    peak = int(torch.cuda.max_memory_allocated(device)) if measure_memory else 0
+    return elapsed, peak
