@@ -7,6 +7,7 @@ from .cache_capacity import (
     simulate_contiguous_reservation,
     simulate_paged_allocation,
 )
+from .block_admission import BlockReservation, PagedBlockAdmissionController
 from .hf_baseline import GenerationResult, HuggingFaceBaseline, StepOutput
 from .generation import GreedyGenerationOutput, greedy_generate
 from .kv_cache import ContiguousKVCache, LayerKVCache, PendingAppend
@@ -46,6 +47,7 @@ from .scheduler import (
 
 __all__ = [
     "CapacitySimulationResult",
+    "BlockReservation",
     "GenerationResult",
     "GreedyGenerationOutput",
     "HuggingFaceBaseline",
@@ -61,6 +63,7 @@ __all__ = [
     "PagedKVCacheManager",
     "PagedRequestKVCache",
     "PagedAttentionReferenceOutput",
+    "PagedBlockAdmissionController",
     "PendingAppend",
     "PendingBlockAppend",
     "QwenConfig",

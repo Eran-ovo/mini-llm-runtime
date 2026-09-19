@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -41,6 +41,11 @@ class RequestState:
     @property
     def generated_token_ids(self) -> tuple[int, ...]:
         return tuple(self._generated_token_ids)
+
+    @property
+    def max_cache_tokens(self) -> int:
+        # 最后一个生成 token 不再作为 Decode 输入，因此不写入 KV Cache。
+        return len(self.prompt_token_ids) + self.max_new_tokens - 1
 
 
 @dataclass(frozen=True)
@@ -88,7 +93,13 @@ class RequestScheduler:
     outstanding batch，模拟 GPU batch 尚未完成时请求不能被重复调度。
     """
 
-    def __init__(self, *, max_running_requests: int, max_batch_tokens: int) -> None:
+    def __init__(
+        self,
+        *,
+        max_running_requests: int,
+        max_batch_tokens: int,
+        admission_callback: Callable[[RequestState], bool] | None = None,
+    ) -> None:
         if max_running_requests <= 0 or max_batch_tokens <= 0:
             raise ValueError("max_running_requests 和 max_batch_tokens 必须 > 0")
         if max_running_requests > max_batch_tokens:
@@ -98,6 +109,7 @@ class RequestScheduler:
             )
         self.max_running_requests = max_running_requests
         self.max_batch_tokens = max_batch_tokens
+        self._admission_callback = admission_callback
         self._requests: dict[str, RequestState] = {}
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
@@ -200,6 +212,13 @@ class RequestScheduler:
             # strict FIFO：队首放不下时停止，不能越过它选择更短的后续请求。
             if token_count + prompt_cost > self.max_batch_tokens:
                 break
+            # callback 必须保证：返回 False 时无副作用；返回 True 时资源已经
+            # 原子预留。资源不足同样遵守 strict FIFO，不跳过队首请求。
+            if (
+                self._admission_callback is not None
+                and not self._admission_callback(request)
+            ):
+                break
             self._waiting.popleft()
             request.status = RequestStatus.RUNNING
             self._running.append(request_id)
@@ -214,8 +233,8 @@ class RequestScheduler:
             available_slots -= 1
 
         if not items:
-            # submit 已禁止 prompt 大于全局 budget，因此只有内部状态损坏才会到这里。
-            raise RuntimeError("存在未完成请求，但当前策略无法生成非空 batch")
+            # waiting 可能因外部 block budget 暂时无法接纳；队列保持不变。
+            return None
         batch = SchedulerBatch(
             step_index=self._next_step_index,
             items=tuple(items),

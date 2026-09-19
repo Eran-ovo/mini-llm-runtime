@@ -174,6 +174,31 @@ class RequestBlockTable:
         self.commit_append()
         return pending.new_block_ids
 
+    def reserve_capacity(self, token_capacity: int) -> tuple[int, ...]:
+        """只扩展物理 block 容量，不推进可见 token_count。
+
+        Scheduler 可在接纳请求时保守预留完整生命周期容量；后续 begin_append
+        会复用这些 block。分配失败由 allocator 保证原子性。
+        """
+        self._require_active()
+        if self._pending is not None:
+            raise RuntimeError("存在未提交 append，不能改变预留容量")
+        if isinstance(token_capacity, bool) or not isinstance(token_capacity, int):
+            raise ValueError("token_capacity 必须是整数")
+        if token_capacity < self.token_count:
+            raise ValueError("token_capacity 不能小于当前已提交 token_count")
+        required_blocks = (
+            (token_capacity + self.block_size - 1) // self.block_size
+            if token_capacity > 0
+            else 0
+        )
+        additional_blocks = required_blocks - self.block_count
+        if additional_blocks <= 0:
+            return ()
+        new_block_ids = self._allocator.allocate(additional_blocks)
+        self._block_ids.extend(new_block_ids)
+        return new_block_ids
+
     def begin_append(self, token_count: int) -> PendingBlockAppend:
         """预留 token 地址与必要 block，但暂不推进可见 token_count。"""
         self._require_active()

@@ -186,6 +186,6 @@ python -m experiments.scheduler_walkthrough
 - 没有异步 CUDA stream/event；
 - 没有 TTFT、TPOT 或吞吐 benchmark。
 
-下一步只应增加“block-aware admission”：Scheduler/Engine 在接纳 Prefill 前查询 Paged KV
-Cache 的可用 block，原子创建请求 Cache；完成事件则释放它。仍先使用 fake ModelRunner，
-把显存准入与状态迁移验证清楚，再实现真正的 batched Qwen execution。
+后续已完成保守的 block-aware admission：接纳时按请求最大生命周期预留物理 block，
+完成事件释放全部 reservation。原理、利用率代价与确定性测试见
+[Block-aware Admission](block_aware_admission.md)。真正的 batched Qwen execution 仍未实现。

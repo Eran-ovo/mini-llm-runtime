@@ -292,8 +292,20 @@ python -m experiments.scheduler_walkthrough
 
 Scheduler 只维护 waiting/running/finished 状态并产生完成事件；Engine 消费事件后才让
 KV Cache Manager 释放物理块。策略取舍、outstanding batch 约束和动态进出队示例见
-[Scheduler 状态机学习记录](docs/scheduler_state_machine.md)。当前尚未实现 block-aware
-admission、chunked prefill 或真实 GPU Continuous Batch。
+[Scheduler 状态机学习记录](docs/scheduler_state_machine.md)。
+
+保守的 block-aware baseline 会在接纳时按
+`prompt_length + max_new_tokens - 1` 预留完整生命周期 blocks，防止尚无 preemption
+机制时 Decode 中途 OOM。它会牺牲可接纳请求数，因此不是最终策略：
+
+```bash
+python -m pytest -q tests/test_block_admission.py
+python -m experiments.block_aware_scheduler_walkthrough
+```
+
+原子预留、资源阻塞、完成释放及其利用率代价见
+[Block-aware Admission 学习记录](docs/block_aware_admission.md)。当前尚未实现 chunked
+prefill、按需增长/preemption 或真实 GPU Continuous Batch。
 
 在固定的纯 KV Cache 显存预算下，下面的确定性模拟会让连续预留和不同 block size
 处理同一批 FIFO 请求，并输出接纳请求数、block/预留区利用率、slot 利用率和内部碎片：

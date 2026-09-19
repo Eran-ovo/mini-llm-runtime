@@ -64,8 +64,9 @@ CUDA 地址计算，无法有效定位。
 - 与 Static Batching 在同一 workload 下比较 TTFT、TPOT、吞吐和显存。
 
 当前已完成第一小步的同步 CPU 状态机与 token budget baseline，详见
-[Scheduler 状态机学习记录](scheduler_state_machine.md)。block-aware admission、batched
-ModelRunner 和性能对比仍未实现。
+[Scheduler 状态机学习记录](scheduler_state_machine.md)。保守的完整生命周期
+[block-aware admission](block_aware_admission.md) 也已完成；batched ModelRunner、按需
+block 增长/preemption 和性能对比仍未实现。
 
 ### v1.0 收尾
 

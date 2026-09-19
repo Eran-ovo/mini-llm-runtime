@@ -111,6 +111,12 @@ class PagedKVCacheManager:
         """通过 request ID 事务式追加全层 K/V。"""
         self.storage.append_all(self.get_request(request_id), key, value)
 
+    def reserve_request_capacity(
+        self, request_id: str, token_capacity: int
+    ) -> tuple[int, ...]:
+        """为请求预留物理 token 容量，但不改变其可见 sequence length。"""
+        return self.get_request(request_id).reserve_capacity(token_capacity)
+
     def gather(
         self, request_id: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
