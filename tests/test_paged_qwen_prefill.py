@@ -33,14 +33,28 @@ def test_adapter_exposes_pending_only_after_each_layer_is_written() -> None:
     actual_key, actual_value = cache.view_layer(0, include_pending=True)
     assert torch.equal(actual_key, layer_zero_key)
     assert torch.equal(actual_value, layer_zero_value)
+    layer_zero_inputs = cache.paged_attention_inputs(0)
+    assert layer_zero_inputs.key_cache.shape == (4, 1, 2, 2)
+    assert layer_zero_inputs.block_table.tolist() == [[0, 1]]
+    assert layer_zero_inputs.sequence_lengths.tolist() == [3]
     with pytest.raises(RuntimeError, match="尚未写入"):
         cache.view_layer(1, include_pending=True)
+    with pytest.raises(RuntimeError, match="尚未写入"):
+        cache.paged_attention_inputs(1)
     with pytest.raises(RuntimeError, match="尚未写入的层"):
         cache.commit_append()
 
     layer_one_key = layer_zero_key + 1_000
     layer_one_value = layer_zero_value + 1_000
     cache.write_layer(1, layer_one_key, layer_one_value)
+    layer_one_inputs = cache.paged_attention_inputs(1)
+    # 同一次 append 的所有层复用同一份 GPU metadata，而 K/V view 随层变化。
+    assert layer_one_inputs.block_table.data_ptr() == layer_zero_inputs.block_table.data_ptr()
+    assert (
+        layer_one_inputs.sequence_lengths.data_ptr()
+        == layer_zero_inputs.sequence_lengths.data_ptr()
+    )
+    assert layer_one_inputs.key_cache.data_ptr() != layer_zero_inputs.key_cache.data_ptr()
     cache.commit_append()
 
     assert cache.length == 3

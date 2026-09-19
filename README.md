@@ -204,7 +204,8 @@ block table、sequence lengths 和碎片统计。
 
 当前版本覆盖跨块增长、OOM 原子失败、请求释放、物理块复用、double-free 防护，
 以及 GPU 物理 block 的写入/gather 对拍；ModelRunner Prefill 与单 token Decode
-已可通过逐层 adapter 写入非连续物理块，但 Decode 仍未切换到 CUDA Paged Attention。
+已可通过逐层 adapter 写入非连续物理块。单请求 Decode 可显式选择 `paged_cuda`
+backend，直接读取物理 Cache，不再经过连续 K/V gather。
 
 ```bash
 python -m experiments.paged_block_table_walkthrough
@@ -213,6 +214,10 @@ python -m experiments.paged_cache_manager_walkthrough
 python -m experiments.paged_qwen_prefill_runner --local-files-only
 python -m experiments.paged_qwen_decode_runner --local-files-only
 ```
+
+其中最后一个入口会强制第一次 Decode 跨 block，并逐层比较 CUDA Attention 与独立
+Python reference。事务顺序、metadata 复用、三层正确性标准和真实 Qwen 结果见
+[ModelRunner Paged Decode 集成记录](docs/model_runner_paged_decode.md)。
 
 在编写 CUDA kernel 前，先运行 Decode-only PyTorch Paged Attention reference。该实现
 直接按 block table 读取非连续物理 K/V，支持变长 batch 和 GQA，并与 gather 后的连续

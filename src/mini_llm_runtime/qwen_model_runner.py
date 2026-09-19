@@ -9,6 +9,11 @@ import torch
 import torch.nn.functional as F
 
 from .kv_cache import LayerKVCache
+from .paged_attention_cuda import (
+    _paged_decode_attention_cuda_unchecked,
+    paged_decode_attention_cuda,
+)
+from .paged_kv_adapter import PagedRequestKVCache
 from .qwen_config import QwenConfig
 from .qwen_weights import AttentionWeights, DecoderLayerWeights, QwenWeights
 
@@ -75,6 +80,7 @@ def _attention(
     apply_causal_mask: bool,
     cache: LayerKVCache | None = None,
     layer_index: int | None = None,
+    use_paged_decode_attention: bool = False,
 ) -> torch.Tensor:
     query = _heads(
         F.linear(x, weights.q_proj.weight, weights.q_proj.bias),
@@ -98,25 +104,50 @@ def _attention(
             raise ValueError("使用 KV Cache 时必须提供 layer_index")
         # Cache 持久化 RoPE 后的 K 和原始 V；当前层随后即可看见 pending prompt。
         cache.write_layer(layer_index, key, value)
-        key, value = cache.view_layer(layer_index, include_pending=True)
-    key = _repeat_kv(key, config.gqa_group_size)
-    value = _repeat_kv(value, config.gqa_group_size)
-
-    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(config.head_dim)
     query_length = x.shape[1]
-    if apply_causal_mask:
-        key_length = key.shape[2]
-        if query_length != key_length:
-            raise ValueError("当前 causal mask 只支持 Prefill 的方形 attention")
-        future = torch.triu(
-            torch.ones(
-                (query_length, key_length), device=x.device, dtype=torch.bool
-            ),
-            diagonal=1,
+    if use_paged_decode_attention:
+        if not isinstance(cache, PagedRequestKVCache):
+            raise TypeError("paged_cuda Decode 需要 PagedRequestKVCache")
+        if query_length != 1 or apply_causal_mask:
+            raise ValueError("Paged Attention v1 只支持无显式 mask 的单 token Decode")
+        inputs = cache.paged_attention_inputs(layer_index)
+        query_decode = query[:, :, 0, :].contiguous()
+        # 地址元数据对所有层相同：第 0 层走安全入口完成一次同步验证，后续层
+        # 只跳过 metadata CPU copy，其余 shape/dtype/device 检查仍在 C++ 中执行。
+        operation = (
+            paged_decode_attention_cuda
+            if layer_index == 0
+            else _paged_decode_attention_cuda_unchecked
         )
-        scores = scores.masked_fill(future[None, None], torch.finfo(x.dtype).min)
-    probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
-    per_head = torch.matmul(probabilities, value)
+        per_head = operation(
+            query_decode,
+            inputs.key_cache,
+            inputs.value_cache,
+            inputs.block_table,
+            inputs.sequence_lengths,
+        ).unsqueeze(2)
+    else:
+        if cache is not None:
+            key, value = cache.view_layer(layer_index, include_pending=True)
+        key = _repeat_kv(key, config.gqa_group_size)
+        value = _repeat_kv(value, config.gqa_group_size)
+
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(config.head_dim)
+        if apply_causal_mask:
+            key_length = key.shape[2]
+            if query_length != key_length:
+                raise ValueError("当前 causal mask 只支持 Prefill 的方形 attention")
+            future = torch.triu(
+                torch.ones(
+                    (query_length, key_length), device=x.device, dtype=torch.bool
+                ),
+                diagonal=1,
+            )
+            scores = scores.masked_fill(
+                future[None, None], torch.finfo(x.dtype).min
+            )
+        probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
+        per_head = torch.matmul(probabilities, value)
     merged = (
         per_head.transpose(1, 2)
         .contiguous()
@@ -134,6 +165,7 @@ def _decoder_layer(
     apply_causal_mask: bool,
     cache: LayerKVCache | None = None,
     layer_index: int | None = None,
+    use_paged_decode_attention: bool = False,
 ) -> torch.Tensor:
     residual = x
     x = _rms_norm(x, weights.input_norm, config.rms_norm_eps)
@@ -145,6 +177,7 @@ def _decoder_layer(
         apply_causal_mask=apply_causal_mask,
         cache=cache,
         layer_index=layer_index,
+        use_paged_decode_attention=use_paged_decode_attention,
     )
     residual = x
     x = _rms_norm(x, weights.post_attention_norm, config.rms_norm_eps)
@@ -163,11 +196,20 @@ class QwenPrefillOutput:
 class QwenPrefillRunner:
     """支持等长、无 padding 的 Qwen2 Prefill 与单 token Decode。"""
 
-    def __init__(self, config: QwenConfig, weights: QwenWeights) -> None:
+    def __init__(
+        self,
+        config: QwenConfig,
+        weights: QwenWeights,
+        *,
+        decode_attention_backend: str = "torch",
+    ) -> None:
         if len(weights.layers) != config.num_hidden_layers:
             raise ValueError("权重层数与配置不一致")
+        if decode_attention_backend not in {"torch", "paged_cuda"}:
+            raise ValueError("decode_attention_backend 必须是 'torch' 或 'paged_cuda'")
         self.config = config
         self.weights = weights
+        self.decode_attention_backend = decode_attention_backend
 
     @torch.inference_mode()
     def prefill(
@@ -240,6 +282,9 @@ class QwenPrefillRunner:
 
         batch = token_ids.shape[0]
         self._validate_cache_layout(cache, batch)
+        use_paged_decode_attention = self.decode_attention_backend == "paged_cuda"
+        if use_paged_decode_attention and not isinstance(cache, PagedRequestKVCache):
+            raise TypeError("paged_cuda Decode 需要 PagedRequestKVCache")
         if cache.pending is not None:
             raise ValueError("Decode 开始前 KV Cache 不能存在未提交 append")
         if cache.length == 0:
@@ -268,6 +313,7 @@ class QwenPrefillRunner:
                     apply_causal_mask=False,
                     cache=cache,
                     layer_index=layer_index,
+                    use_paged_decode_attention=use_paged_decode_attention,
                 )
                 if captured is not None:
                     captured.append(x)
