@@ -1,4 +1,4 @@
-"""基于自有 ModelRunner 和连续 KV Cache 的最小生成控制循环。"""
+"""基于自有 ModelRunner 和 LayerKVCache 的最小生成控制循环。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .kv_cache import ContiguousKVCache
+from .kv_cache import ContiguousKVCache, LayerKVCache
 from .qwen_model_runner import QwenPrefillRunner
 
 
@@ -20,6 +20,7 @@ class GreedyGenerationOutput:
     prefill_tokens: int
     decode_steps: int
     cache_length: int
+    # 生成开始前，该请求在当时 Cache/pool 状态下最多可达到的 token 数。
     cache_capacity: int
     # 仅供 correctness/debug 使用；默认不保存，避免 logits 长期占用显存。
     step_logits: tuple[torch.Tensor, ...] | None = None
@@ -32,7 +33,7 @@ def greedy_generate(
     *,
     max_new_tokens: int,
     eos_token_ids: int | Collection[int] | None = None,
-    cache: ContiguousKVCache | None = None,
+    cache: LayerKVCache | None = None,
     return_step_logits: bool = False,
 ) -> GreedyGenerationOutput:
     """执行一次 Prefill 和若干次单 token Decode。
@@ -66,10 +67,15 @@ def greedy_generate(
             dtype=runner.weights.embedding.dtype,
             device=runner.weights.embedding.device,
         )
-    elif cache.capacity < required_capacity:
-        # 在 Prefill 修改 Cache 之前失败，避免生成到中途才发现容量不足。
+    if cache.length != 0 or cache.pending is not None:
+        raise ValueError("greedy_generate 只接受空闲且 length=0 的 KV Cache")
+    # 对连续 Cache，这是固定 capacity；对 Paged Cache，这是当前请求使用
+    # 最后一块余量和 pool 全部空闲块时可达到的容量快照。
+    cache_capacity = cache.length + cache.available_token_capacity
+    if cache_capacity < required_capacity:
+        # 必须在 Prefill 修改 Cache 之前失败，避免生成到中途才发现 block 不足。
         raise RuntimeError(
-            f"KV Cache capacity={cache.capacity} 小于生成所需的 "
+            f"KV Cache capacity={cache_capacity} 小于生成所需的 "
             f"required_capacity={required_capacity}"
         )
 
@@ -104,7 +110,7 @@ def greedy_generate(
         prefill_tokens=prompt_length,
         decode_steps=decode_steps,
         cache_length=cache.length,
-        cache_capacity=cache.capacity,
+        cache_capacity=cache_capacity,
         step_logits=(
             tuple(captured_logits) if captured_logits is not None else None
         ),

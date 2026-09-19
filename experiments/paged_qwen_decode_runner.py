@@ -23,9 +23,9 @@ END_TO_END_ATOL = 3e-2
 END_TO_END_RTOL = 3e-3
 
 
-def install_layer_attention_verifier() -> list[dict[str, float | bool | str]]:
+def install_layer_attention_verifier() -> list[dict[str, object]]:
     """仅在 correctness 实验中包装 CUDA 调用，逐层与独立 reference 对拍。"""
-    records: list[dict[str, float | bool | str]] = []
+    records: list[dict[str, object]] = []
     original_checked = qwen_model_runner_module.paged_decode_attention_cuda
     original_unchecked = (
         qwen_model_runner_module._paged_decode_attention_cuda_unchecked
@@ -48,6 +48,8 @@ def install_layer_attention_verifier() -> list[dict[str, float | bool | str]]:
                     "entry": entry,
                     "max_abs": float(error.max().item()),
                     "mean_abs": float(error.mean().item()),
+                    "sequence_length": int(lengths.item()),
+                    "block_table": tuple(int(item) for item in table[0].tolist()),
                     "allclose": bool(
                         torch.allclose(
                             actual.float(), expected.float(), atol=2e-3, rtol=2e-3

@@ -213,11 +213,15 @@ python -m experiments.paged_kv_storage_walkthrough
 python -m experiments.paged_cache_manager_walkthrough
 python -m experiments.paged_qwen_prefill_runner --local-files-only
 python -m experiments.paged_qwen_decode_runner --local-files-only
+python -m experiments.paged_greedy_generation_runner \
+  --max-new-tokens 8 --block-size 3 --local-files-only
 ```
 
-其中最后一个入口会强制第一次 Decode 跨 block，并逐层比较 CUDA Attention 与独立
+单 token 入口会强制第一次 Decode 跨 block，并逐层比较 CUDA Attention 与独立
 Python reference。事务顺序、metadata 复用、三层正确性标准和真实 Qwen 结果见
 [ModelRunner Paged Decode 集成记录](docs/model_runner_paged_decode.md)。
+多 token 入口进一步覆盖块内复用、反复跨块、EOS 和容量预检，结果与状态不变量见
+[多 token Paged CUDA Decode 记录](docs/paged_greedy_decode.md)。
 
 在编写 CUDA kernel 前，先运行 Decode-only PyTorch Paged Attention reference。该实现
 直接按 block table 读取非连续物理 K/V，支持变长 batch 和 GQA，并与 gather 后的连续
