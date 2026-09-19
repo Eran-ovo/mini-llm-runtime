@@ -238,6 +238,25 @@ python -m pytest -q tests/test_paged_attention_cuda.py
 它用于验证 CUDA 地址映射与数值语义，尚未进行 warp reduction、向量化加载或 token
 并行，不能作为最终性能数据。
 
+优化前先建立 v1 baseline。benchmark 在计时前验证一次固定 metadata，计时内使用
+unchecked hot path；Paged 路径直接读取打散的物理 block，SDPA 路径使用预先准备的
+连续 K/V，且不把 gather 算入 SDPA 时间：
+
+```bash
+python scripts/benchmark_paged_attention.py \
+  --batch-sizes 1,8 \
+  --sequence-lengths 16,128,512,2048 \
+  --block-size 16 \
+  --warmup 5 \
+  --repeats 20 \
+  --iterations-per-sample 20 \
+  --output-dir benchmarks/results/paged_attention_v1
+```
+
+每个 sample 用 CUDA Event 包围多次 launch，再除以迭代次数，以降低微秒级 kernel
+的测量噪声。两条路径按轮交错，并在奇数轮反转先后顺序。JIT 编译、输入构造和一次性
+metadata 验证都在 warmup/计时区间之外。
+
 在固定的纯 KV Cache 显存预算下，下面的确定性模拟会让连续预留和不同 block size
 处理同一批 FIFO 请求，并输出接纳请求数、block/预留区利用率、slot 利用率和内部碎片：
 

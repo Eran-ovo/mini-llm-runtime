@@ -6,7 +6,8 @@ torch::Tensor paged_decode_attention_cuda_forward(
     torch::Tensor value_cache,
     torch::Tensor block_table,
     torch::Tensor sequence_lengths,
-    double scale);
+    double scale,
+    bool validate_metadata);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.doc() = "Mini LLM Runtime CUDA kernels";
@@ -19,5 +20,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         pybind11::arg("value_cache"),
         pybind11::arg("block_table"),
         pybind11::arg("sequence_lengths"),
-        pybind11::arg("scale"));
+        pybind11::arg("scale"),
+        pybind11::arg("validate_metadata") = true);
 }

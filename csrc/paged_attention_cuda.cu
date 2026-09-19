@@ -113,7 +113,8 @@ torch::Tensor paged_decode_attention_cuda_forward(
     torch::Tensor value_cache,
     torch::Tensor block_table,
     torch::Tensor sequence_lengths,
-    double scale)
+    double scale,
+    bool validate_metadata)
 {
     using namespace paged_attention_v1;
 
@@ -177,28 +178,30 @@ torch::Tensor paged_decode_attention_cuda_forward(
     TORCH_CHECK(batch64 <= INT_MAX / query_heads64,
                 "batch * query_heads exceeds CUDA grid limit");
 
-    // v1 是 correctness kernel：把很小的 metadata 同步到 CPU，逐请求验证真正会被
-    // 访问的 block ID。正式 benchmark 前必须把这一步移到请求创建/调度边界，不能
-    // 让每个 Decode launch 都承担 D2H copy 和同步。
-    const auto lengths_cpu = sequence_lengths.to(at::kCPU);
-    const auto block_table_cpu = block_table.to(at::kCPU);
-    const int32_t* lengths_ptr = lengths_cpu.data_ptr<int32_t>();
-    const int32_t* table_ptr = block_table_cpu.data_ptr<int32_t>();
-    for (int64_t batch_index = 0; batch_index < batch64; ++batch_index) {
-        const int64_t sequence_length = lengths_ptr[batch_index];
-        TORCH_CHECK(sequence_length > 0,
-                    "decode sequence lengths must be positive");
-        const int64_t required_blocks =
-            (sequence_length + block_size64 - 1) / block_size64;
-        TORCH_CHECK(required_blocks <= max_blocks64,
-                    "sequence length requires more blocks than block_table provides");
-        for (int64_t logical_block = 0;
-             logical_block < required_blocks;
-             ++logical_block) {
-            const int32_t physical_block = table_ptr[
-                batch_index * max_blocks64 + logical_block];
-            TORCH_CHECK(physical_block >= 0 && physical_block < total_blocks64,
-                        "used block_table entry contains an out-of-range physical block ID");
+    if (validate_metadata) {
+        // correctness 入口把很小的 metadata 同步到 CPU，逐请求验证真正会被访问的
+        // block ID。benchmark 在计时前通过安全入口验证一次，热路径传 false。
+        const auto lengths_cpu = sequence_lengths.to(at::kCPU);
+        const auto block_table_cpu = block_table.to(at::kCPU);
+        const int32_t* lengths_ptr = lengths_cpu.data_ptr<int32_t>();
+        const int32_t* table_ptr = block_table_cpu.data_ptr<int32_t>();
+        for (int64_t batch_index = 0; batch_index < batch64; ++batch_index) {
+            const int64_t sequence_length = lengths_ptr[batch_index];
+            TORCH_CHECK(sequence_length > 0,
+                        "decode sequence lengths must be positive");
+            const int64_t required_blocks =
+                (sequence_length + block_size64 - 1) / block_size64;
+            TORCH_CHECK(required_blocks <= max_blocks64,
+                        "sequence length requires more blocks than block_table provides");
+            for (int64_t logical_block = 0;
+                 logical_block < required_blocks;
+                 ++logical_block) {
+                const int32_t physical_block = table_ptr[
+                    batch_index * max_blocks64 + logical_block];
+                TORCH_CHECK(
+                    physical_block >= 0 && physical_block < total_blocks64,
+                    "used block_table entry contains an out-of-range physical block ID");
+            }
         }
     }
 

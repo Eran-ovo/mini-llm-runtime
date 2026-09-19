@@ -3,7 +3,10 @@ import torch
 from torch.utils.cpp_extension import CUDA_HOME
 
 from mini_llm_runtime.paged_attention import paged_decode_attention_reference
-from mini_llm_runtime.paged_attention_cuda import paged_decode_attention_cuda
+from mini_llm_runtime.paged_attention_cuda import (
+    _paged_decode_attention_cuda_unchecked,
+    paged_decode_attention_cuda,
+)
 from mini_llm_runtime.paged_kv_manager import PagedKVCacheManager
 
 
@@ -64,6 +67,16 @@ def test_cuda_kernel_matches_reference_for_qwen_gqa_shape() -> None:
     assert metadata.block_table.tolist() == [[1, 3, 4], [0, 2, -1]]
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+
+    # benchmark hot path 只跳过 metadata D2H 验证，不能改变 kernel 数值结果。
+    unchecked = _paged_decode_attention_cuda_unchecked(
+        query,
+        manager.storage.key[0],
+        manager.storage.value[0],
+        metadata.block_table,
+        metadata.sequence_lengths,
+    )
+    torch.testing.assert_close(unchecked, actual, rtol=0, atol=0)
 
 
 def test_cuda_kernel_supports_mqa_and_custom_scale() -> None:
