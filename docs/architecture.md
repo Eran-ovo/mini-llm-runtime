@@ -63,9 +63,12 @@ CUDA 地址计算，无法有效定位。
 - token/block budget、请求完成和 cache 回收行为均有确定性测试。
 - 与 Static Batching 在同一 workload 下比较 TTFT、TPOT、吞吐和显存。
 
+当前已完成第一小步的同步 CPU 状态机与 token budget baseline，详见
+[Scheduler 状态机学习记录](scheduler_state_machine.md)。block-aware admission、batched
+ModelRunner 和性能对比仍未实现。
+
 ### v1.0 收尾
 
 - README、架构图、测试矩阵、机器可读与 Markdown benchmark 全部可复现。
 - Nsight Systems/Compute 分析能解释主要瓶颈，并记录有价值的失败实验。
 - 简历数字只引用仓库内正式结果；创建 release 前稳定入口通过全部测试。
-

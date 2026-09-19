@@ -33,6 +33,16 @@ from .qwen_config import QwenConfig
 from .qwen_loader import load_qwen_checkpoint, load_qwen_config, load_qwen_weights
 from .qwen_model_runner import QwenPrefillOutput, QwenPrefillRunner
 from .qwen_weights import QwenWeights
+from .scheduler import (
+    FinishReason,
+    RequestScheduler,
+    RequestState,
+    RequestStatus,
+    ScheduledRequest,
+    SchedulerBatch,
+    SchedulerStepUpdate,
+    WorkKind,
+)
 
 __all__ = [
     "CapacitySimulationResult",
@@ -58,7 +68,15 @@ __all__ = [
     "QwenPrefillRunner",
     "QwenWeights",
     "RequestBlockTable",
+    "RequestScheduler",
+    "RequestState",
+    "RequestStatus",
+    "FinishReason",
+    "ScheduledRequest",
+    "SchedulerBatch",
+    "SchedulerStepUpdate",
     "StepOutput",
+    "WorkKind",
     "greedy_generate",
     "generate_log_uniform_lengths",
     "load_qwen_checkpoint",

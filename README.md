@@ -4,9 +4,9 @@
 `Qwen/Qwen2.5-0.5B`，主线是从可信的 Hugging Face reference 出发，逐步实现
 ModelRunner、KV Cache、Paged Attention 和 Continuous Batching。
 
-当前阶段：**v0.5 Paged Attention correctness baseline（进行中）**。已具备独立权重
-加载、Qwen ModelRunner、连续与 Paged KV Cache，以及支持 FP16、`head_dim=64`、
-GQA/MQA 和变长 batch 的第一版 Decode CUDA kernel；该 kernel 尚未进入性能优化阶段。
+当前阶段：**v0.6 Continuous Batching correctness baseline（进行中）**。已具备独立权重
+加载、Qwen ModelRunner、连续与 Paged KV Cache、Decode CUDA Paged Attention，以及
+单请求多 token 生成闭环；当前正在固定请求状态机和调度语义，尚未接入 batched Runner。
 
 ## 架构主线
 
@@ -278,6 +278,22 @@ CUDA Event 包围 Python launch 循环时可能包含 GPU 等待 host 提交的�
 [split-KV 分区扫描](docs/split_kv_sweep.md)。
 S=32/64 的 partial/merge 硬件指标、profiler 与 Event 测量边界以及停止继续扫参的决策见
 [split-KV profiler 学习记录](docs/split_kv_profile.md)。
+
+## Scheduler 状态机
+
+v0.6 的第一步是纯 CPU、同步的请求 Scheduler。它使用 Decode-priority、whole-prefill、
+strict-FIFO baseline，在每个 step 按 `max_batch_tokens` 和
+`max_running_requests` 动态组成 Prefill/Decode batch：
+
+```bash
+python -m pytest -q tests/test_scheduler.py
+python -m experiments.scheduler_walkthrough
+```
+
+Scheduler 只维护 waiting/running/finished 状态并产生完成事件；Engine 消费事件后才让
+KV Cache Manager 释放物理块。策略取舍、outstanding batch 约束和动态进出队示例见
+[Scheduler 状态机学习记录](docs/scheduler_state_machine.md)。当前尚未实现 block-aware
+admission、chunked prefill 或真实 GPU Continuous Batch。
 
 在固定的纯 KV Cache 显存预算下，下面的确定性模拟会让连续预留和不同 block size
 处理同一批 FIFO 请求，并输出接纳请求数、block/预留区利用率、slot 利用率和内部碎片：
