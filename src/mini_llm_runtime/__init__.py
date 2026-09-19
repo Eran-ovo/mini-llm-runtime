@@ -11,6 +11,11 @@ from .hf_baseline import GenerationResult, HuggingFaceBaseline, StepOutput
 from .generation import GreedyGenerationOutput, greedy_generate
 from .kv_cache import ContiguousKVCache, LayerKVCache, PendingAppend
 from .paged_kv_adapter import PagedRequestKVCache
+from .paged_attention import (
+    PagedAttentionReferenceOutput,
+    paged_decode_attention_reference,
+)
+from .paged_attention_cuda import paged_decode_attention_cuda
 from .paged_kv_cache import (
     BlockLocation,
     BlockPoolExhaustedError,
@@ -45,6 +50,7 @@ __all__ = [
     "PagedCacheStats",
     "PagedKVCacheManager",
     "PagedRequestKVCache",
+    "PagedAttentionReferenceOutput",
     "PendingAppend",
     "PendingBlockAppend",
     "QwenConfig",
@@ -58,6 +64,8 @@ __all__ = [
     "load_qwen_checkpoint",
     "load_qwen_config",
     "load_qwen_weights",
+    "paged_decode_attention_reference",
+    "paged_decode_attention_cuda",
     "simulate_contiguous_reservation",
     "simulate_paged_allocation",
 ]

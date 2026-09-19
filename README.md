@@ -4,9 +4,9 @@
 `Qwen/Qwen2.5-0.5B`，主线是从可信的 Hugging Face reference 出发，逐步实现
 ModelRunner、KV Cache、Paged Attention 和 Continuous Batching。
 
-当前里程碑：**v0.4 Paged KV Cache**。已具备独立权重加载、Qwen ModelRunner、
-Prefill、单 token Decode、单请求 greedy generation、连续 KV Cache benchmark，以及
-带物理 block pool、block table 和请求生命周期的 Paged KV Cache。
+当前阶段：**v0.5 Paged Attention correctness baseline（进行中）**。已具备独立权重
+加载、Qwen ModelRunner、连续与 Paged KV Cache，以及支持 FP16、`head_dim=64`、
+GQA/MQA 和变长 batch 的第一版 Decode CUDA kernel；该 kernel 尚未进入性能优化阶段。
 
 ## 架构主线
 
@@ -213,6 +213,30 @@ python -m experiments.paged_cache_manager_walkthrough
 python -m experiments.paged_qwen_prefill_runner --local-files-only
 python -m experiments.paged_qwen_decode_runner --local-files-only
 ```
+
+在编写 CUDA kernel 前，先运行 Decode-only PyTorch Paged Attention reference。该实现
+直接按 block table 读取非连续物理 K/V，支持变长 batch 和 GQA，并与 gather 后的连续
+Attention 数学结果对拍：
+
+```bash
+python -m experiments.paged_attention_reference_walkthrough
+```
+
+Reference 会显式物化 score/probability，并包含 Python loop 与 CUDA 同步，只用于定义
+正确语义，不能用于 benchmark。未来 CUDA kernel 必须保持相同的地址映射和跨 block
+Softmax 结果，但会用 online softmax 避免保存完整 attention vector。
+
+第一版 CUDA correctness kernel 采用一个 CTA 处理一个 `(request, query_head)`，支持
+Qwen2.5-0.5B 所需的 FP16、`head_dim=64`、GQA/MQA 和变长 batch。首次调用会通过
+PyTorch JIT extension 编译，产物进入用户级 cache：
+
+```bash
+python -m pytest -q tests/test_paged_attention_cuda.py
+```
+
+该版本逐 token 串行扫描，并使用 shared-memory reduction 与 FP32 online softmax；
+它用于验证 CUDA 地址映射与数值语义，尚未进行 warp reduction、向量化加载或 token
+并行，不能作为最终性能数据。
 
 在固定的纯 KV Cache 显存预算下，下面的确定性模拟会让连续预留和不同 block size
 处理同一批 FIFO 请求，并输出接纳请求数、block/预留区利用率、slot 利用率和内部碎片：
