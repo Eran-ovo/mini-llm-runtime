@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from .kv_cache import ContiguousKVCache
+from .kv_cache import LayerKVCache
 from .qwen_config import QwenConfig
 from .qwen_weights import AttentionWeights, DecoderLayerWeights, QwenWeights
 
@@ -73,7 +73,7 @@ def _attention(
     config: QwenConfig,
     *,
     apply_causal_mask: bool,
-    cache: ContiguousKVCache | None = None,
+    cache: LayerKVCache | None = None,
     layer_index: int | None = None,
 ) -> torch.Tensor:
     query = _heads(
@@ -132,7 +132,7 @@ def _decoder_layer(
     config: QwenConfig,
     *,
     apply_causal_mask: bool,
-    cache: ContiguousKVCache | None = None,
+    cache: LayerKVCache | None = None,
     layer_index: int | None = None,
 ) -> torch.Tensor:
     residual = x
@@ -174,7 +174,7 @@ class QwenPrefillRunner:
         self,
         input_ids: torch.Tensor,
         *,
-        cache: ContiguousKVCache | None = None,
+        cache: LayerKVCache | None = None,
         return_layer_outputs: bool = False,
     ) -> QwenPrefillOutput:
         if input_ids.ndim != 2 or input_ids.shape[1] == 0:
@@ -225,10 +225,10 @@ class QwenPrefillRunner:
         self,
         token_ids: torch.Tensor,
         *,
-        cache: ContiguousKVCache,
+        cache: LayerKVCache,
         return_layer_outputs: bool = False,
     ) -> QwenPrefillOutput:
-        """只计算一个新 token，并把每层的新 K/V 追加到连续 Cache。
+        """只计算一个新 token，并把每层的新 K/V 追加到 Cache。
 
         `token_ids` 是上一步 logits 选出的 token；本方法返回的 logits 用于预测
         再下一个 token。当前实现要求整个 batch 的历史长度相同且没有 padding。
@@ -244,7 +244,7 @@ class QwenPrefillRunner:
             raise ValueError("Decode 开始前 KV Cache 不能存在未提交 append")
         if cache.length == 0:
             raise ValueError("decode_one 需要先用 Prefill 初始化非空 KV Cache")
-        if cache.length >= cache.capacity:
+        if cache.available_token_capacity < 1:
             raise RuntimeError("KV Cache capacity 已满，无法追加 Decode token")
         if cache.length >= self.config.max_position_embeddings:
             raise ValueError("Decode 后序列长度将超过 max_position_embeddings")
@@ -286,16 +286,16 @@ class QwenPrefillRunner:
         )
 
     def _validate_empty_prefill_cache(
-        self, cache: ContiguousKVCache, batch_size: int, sequence_length: int
+        self, cache: LayerKVCache, batch_size: int, sequence_length: int
     ) -> None:
         self._validate_cache_layout(cache, batch_size)
         if cache.length != 0 or cache.pending is not None:
             raise ValueError("当前 Prefill 初始化只接受空闲且 length=0 的 KV Cache")
-        if sequence_length > cache.capacity:
+        if sequence_length > cache.available_token_capacity:
             raise RuntimeError("prompt length 超过 KV Cache capacity")
 
     def _validate_cache_layout(
-        self, cache: ContiguousKVCache, batch_size: int
+        self, cache: LayerKVCache, batch_size: int
     ) -> None:
         """校验模型与 Cache 的静态布局；生命周期规则由具体入口负责。"""
         expected = {

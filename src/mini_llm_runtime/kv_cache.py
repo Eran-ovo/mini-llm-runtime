@@ -3,8 +3,41 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
+
+
+class LayerKVCache(Protocol):
+    """ModelRunner 按层追加 K/V 所需的最小结构化接口。"""
+
+    num_layers: int
+    batch_size: int
+    num_kv_heads: int
+    head_dim: int
+    dtype: torch.dtype
+    device: torch.device
+    length: int
+
+    @property
+    def pending(self) -> object | None: ...
+
+    @property
+    def available_token_capacity(self) -> int: ...
+
+    def begin_append(self, token_count: int) -> object: ...
+
+    def write_layer(
+        self, layer_index: int, key: torch.Tensor, value: torch.Tensor
+    ) -> None: ...
+
+    def view_layer(
+        self, layer_index: int, *, include_pending: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+    def commit_append(self) -> None: ...
+
+    def abort_append(self) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -85,6 +118,10 @@ class ContiguousKVCache:
     def storage_nbytes(self) -> int:
         """K 与 V 两块物理 storage 的总字节数。"""
         return self.key.numel() * self.key.element_size() + self.value.numel() * self.value.element_size()
+
+    @property
+    def available_token_capacity(self) -> int:
+        return self.capacity - self.length
 
     def begin_append(self, token_count: int) -> PendingAppend:
         """预留一个尚不可全局读取的逻辑区间，不立即修改 length。"""
@@ -207,4 +244,3 @@ class ContiguousKVCache:
             raise IndexError(
                 f"layer_index={layer_index} 越界，有效范围 [0,{self.num_layers})"
             )
-

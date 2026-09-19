@@ -4,8 +4,9 @@
 `Qwen/Qwen2.5-0.5B`，主线是从可信的 Hugging Face reference 出发，逐步实现
 ModelRunner、KV Cache、Paged Attention 和 Continuous Batching。
 
-当前里程碑：**v0.3 连续 KV Cache**。已具备独立权重加载、Qwen ModelRunner、
-Prefill、单 token Decode、单请求 greedy generation，以及有/无 Cache 的正式 benchmark。
+当前里程碑：**v0.4 Paged KV Cache**。已具备独立权重加载、Qwen ModelRunner、
+Prefill、单 token Decode、单请求 greedy generation、连续 KV Cache benchmark，以及
+带物理 block pool、block table 和请求生命周期的 Paged KV Cache。
 
 ## 架构主线
 
@@ -189,6 +190,48 @@ python scripts/benchmark_kv_cache.py \
 两条路径按轮交错，并在奇偶轮反转先后次序，以降低 Laptop GPU 温度、频率和功耗
 漂移造成的顺序偏差。结果目录包含保存全部 latency/memory 原始样本与环境信息的
 `result.json`，以及便于阅读的 `report.md`。
+
+## Paged KV Cache 元数据
+
+v0.4 先实现地址管理层：`FixedBlockAllocator` 管理固定数量的物理 block ID 和
+free list，`RequestBlockTable` 保存单个请求从逻辑 block 到物理 block 的映射。
+逻辑 token `t` 通过 `t // block_size` 选择 block table 项，再通过
+`t % block_size` 得到块内 offset。`PagedKVStorage` 进一步预分配布局为
+`[layer, physical_block, kv_head, block_offset, head_dim]` 的 K/V tensor，并提供
+事务式写入与仅供 correctness 使用的逻辑连续 gather。`PagedKVCacheManager` 统一
+管理 request registry，并按 Scheduler 指定顺序生成带 `-1` padding 的 GPU int32
+block table、sequence lengths 和碎片统计。
+
+当前版本覆盖跨块增长、OOM 原子失败、请求释放、物理块复用、double-free 防护，
+以及 GPU 物理 block 的写入/gather 对拍；ModelRunner Prefill 与单 token Decode
+已可通过逐层 adapter 写入非连续物理块，Paged Attention 尚未实现。
+
+```bash
+python -m experiments.paged_block_table_walkthrough
+python -m experiments.paged_kv_storage_walkthrough
+python -m experiments.paged_cache_manager_walkthrough
+python -m experiments.paged_qwen_prefill_runner --local-files-only
+python -m experiments.paged_qwen_decode_runner --local-files-only
+```
+
+在固定的纯 KV Cache 显存预算下，下面的确定性模拟会让连续预留和不同 block size
+处理同一批 FIFO 请求，并输出接纳请求数、block/预留区利用率、slot 利用率和内部碎片：
+
+```bash
+python scripts/analyze_kv_cache_capacity.py \
+  --cache-budget-mib 64 \
+  --max-sequence-length 2048 \
+  --block-sizes 1,4,8,16,32,64 \
+  --num-requests 128 \
+  --seed 2027 \
+  --output-dir benchmarks/results/paged_capacity_v04
+```
+
+这里的 request length 表示请求需要驻留在 Cache 中的总 token 数。脚本只做 K/V
+tensor storage 的整数容量分析，不计 block table/Python allocator metadata，也不运行
+GPU kernel，因此其结果不能用于声称 Paged Attention 更快，不需要 CUDA Event 或
+warmup。原始请求长度、首个被拒请求、完整配置、环境与 Git commit 会保存在
+`result.json` 中。
 
 ## 目录
 

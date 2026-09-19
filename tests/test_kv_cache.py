@@ -97,11 +97,11 @@ def test_reset_changes_visibility_without_clearing_storage() -> None:
     cache.reset()
     assert cache.length == 0
     assert cache.view_layer(0)[0].shape[2] == 0
-    assert torch.equal(cache.key, stored)
+    # 未写的 torch.empty 区域可能含 NaN；按字节比较才能验证 reset 没有改 storage。
+    assert torch.equal(cache.key.view(torch.uint8), stored.view(torch.uint8))
 
 
 def test_storage_size_includes_key_and_value() -> None:
     cache = make_cache(layers=3, capacity=5)
     expected = 2 * 3 * 1 * 2 * 5 * 4 * torch.tensor([], dtype=torch.float32).element_size()
     assert cache.storage_nbytes == expected
-
