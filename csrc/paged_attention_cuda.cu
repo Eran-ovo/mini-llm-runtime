@@ -107,7 +107,8 @@ __global__ void paged_decode_attention_fp16_d64_kernel(
 
 }  // namespace paged_attention_v1
 
-torch::Tensor paged_decode_attention_cuda_forward(
+// v1 与 split-KV 共用输入验证，避免两条路径的边界条件逐渐分叉。
+void validate_paged_attention_inputs(
     torch::Tensor query,
     torch::Tensor key_cache,
     torch::Tensor value_cache,
@@ -205,6 +206,23 @@ torch::Tensor paged_decode_attention_cuda_forward(
         }
     }
 
+}
+
+torch::Tensor paged_decode_attention_cuda_forward(
+    torch::Tensor query, torch::Tensor key_cache, torch::Tensor value_cache,
+    torch::Tensor block_table, torch::Tensor sequence_lengths,
+    double scale, bool validate_metadata)
+{
+    using namespace paged_attention_v1;
+    validate_paged_attention_inputs(query, key_cache, value_cache, block_table,
+                                    sequence_lengths, scale, validate_metadata);
+    c10::cuda::CUDAGuard device_guard(query.device());
+    const auto batch64 = query.size(0);
+    const auto query_heads64 = query.size(1);
+    const auto total_blocks64 = key_cache.size(0);
+    const auto kv_heads64 = key_cache.size(1);
+    const auto block_size64 = key_cache.size(2);
+    const auto max_blocks64 = block_table.size(1);
     auto output = torch::empty_like(query);
     const int batch = static_cast<int>(batch64);
     const int query_heads = static_cast<int>(query_heads64);

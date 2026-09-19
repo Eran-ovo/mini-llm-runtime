@@ -19,6 +19,7 @@ def load_cuda_extension() -> ModuleType:
     sources = [
         repo_root / "csrc" / "paged_attention_binding.cpp",
         repo_root / "csrc" / "paged_attention_cuda.cu",
+        repo_root / "csrc" / "paged_attention_split_cuda.cu",
     ]
     missing = [str(path) for path in sources if not path.is_file()]
     if missing:

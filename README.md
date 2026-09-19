@@ -204,7 +204,7 @@ block table、sequence lengths 和碎片统计。
 
 当前版本覆盖跨块增长、OOM 原子失败、请求释放、物理块复用、double-free 防护，
 以及 GPU 物理 block 的写入/gather 对拍；ModelRunner Prefill 与单 token Decode
-已可通过逐层 adapter 写入非连续物理块，Paged Attention 尚未实现。
+已可通过逐层 adapter 写入非连续物理块，但 Decode 仍未切换到 CUDA Paged Attention。
 
 ```bash
 python -m experiments.paged_block_table_walkthrough
@@ -256,6 +256,19 @@ python scripts/benchmark_paged_attention.py \
 每个 sample 用 CUDA Event 包围多次 launch，再除以迭代次数，以降低微秒级 kernel
 的测量噪声。两条路径按轮交错，并在奇数轮反转先后顺序。JIT 编译、输入构造和一次性
 metadata 验证都在 warmup/计时区间之外。
+
+CUDA Event 包围 Python launch 循环时可能包含 GPU 等待 host 提交的空隙，尤其需要
+谨慎解释短 SDPA 时间。单 kernel 的 Nsight Compute 采集入口、原始报告位置与
+瓶颈分析见 [v1 profiler 学习记录](docs/paged_attention_v1_profile.md)。
+
+沿 KV 序列拆分 CTA 的实验实现、online-softmax 状态合并和两轮对照数据见
+[split-KV 实验记录](docs/split_kv_experiment.md)。该入口留在 `experiments/`，
+稳定 runtime 暂不自动切换到 split-KV。
+
+固定 B=1/N=2048 的分区数扫描与原始样本说明见
+[split-KV 分区扫描](docs/split_kv_sweep.md)。
+S=32/64 的 partial/merge 硬件指标、profiler 与 Event 测量边界以及停止继续扫参的决策见
+[split-KV profiler 学习记录](docs/split_kv_profile.md)。
 
 在固定的纯 KV Cache 显存预算下，下面的确定性模拟会让连续预留和不同 block size
 处理同一批 FIFO 请求，并输出接纳请求数、block/预留区利用率、slot 利用率和内部碎片：
