@@ -295,6 +295,40 @@ class RequestScheduler:
             finished_request_ids=tuple(finished),
         )
 
+    def abort_step(self) -> SchedulerBatch:
+        """撤销 outstanding batch，使执行失败的 step 可以安全重试。
+
+        Decode 请求在 schedule 时没有改变逻辑状态；新接纳的 Prefill 请求则需要
+        从 running 退回 waiting 队首。GPU Cache 资源由 Engine/Admission Controller
+        在调用本方法前释放。
+        """
+        batch = self._outstanding
+        if batch is None:
+            raise RuntimeError("当前没有可以撤销的 Scheduler batch")
+
+        prefill_ids = batch.prefill_request_ids
+        prefill_set = set(prefill_ids)
+        for request_id in prefill_ids:
+            request = self._requests[request_id]
+            if request.prefilled or request._generated_token_ids:
+                raise RuntimeError(
+                    f"请求 {request_id!r} 已写回执行结果，不能再 abort step"
+                )
+            request.status = RequestStatus.WAITING
+        self._running = [
+            request_id
+            for request_id in self._running
+            if request_id not in prefill_set
+        ]
+        # 新请求可能在 GPU 执行期间到达；失败请求必须回到它们之前，并保持 FIFO。
+        for request_id in reversed(prefill_ids):
+            self._waiting.appendleft(request_id)
+
+        self._outstanding = None
+        # 失败尝试不消耗逻辑 step 编号，重试仍使用相同 index。
+        self._next_step_index = batch.step_index
+        return batch
+
     @classmethod
     def _validate_token_sequence(
         cls, values: Sequence[int], name: str

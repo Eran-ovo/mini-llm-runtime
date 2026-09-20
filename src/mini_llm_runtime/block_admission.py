@@ -69,16 +69,22 @@ class PagedBlockAdmissionController:
     def release_finished(
         self, request_ids: tuple[str, ...]
     ) -> dict[str, tuple[int, ...]]:
-        """由 Engine 消费完成事件；预校验全部 ID 后再逐请求释放。"""
+        """由 Engine 消费完成事件并释放对应 reservation。"""
+        return self.release_admitted(request_ids)
+
+    def release_admitted(
+        self, request_ids: tuple[str, ...]
+    ) -> dict[str, tuple[int, ...]]:
+        """释放一组已接纳请求；也用于执行失败时撤销本轮 Prefill。"""
         if len(set(request_ids)) != len(request_ids):
-            raise ValueError("finished request IDs 不能重复")
+            raise ValueError("request IDs 不能重复")
         missing = [
             request_id
             for request_id in request_ids
             if request_id not in self._reservations
         ]
         if missing:
-            raise KeyError(f"完成请求没有 block reservation：{missing}")
+            raise KeyError(f"请求没有 block reservation：{missing}")
 
         released: dict[str, tuple[int, ...]] = {}
         for request_id in request_ids:
