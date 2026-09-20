@@ -4,10 +4,11 @@
 `Qwen/Qwen2.5-0.5B`，主线是从可信的 Hugging Face reference 出发，逐步实现
 ModelRunner、KV Cache、Paged Attention 和 Continuous Batching。
 
-当前阶段：**v1.0 release candidate 收尾**。已具备独立权重加载、Qwen ModelRunner、
+当前阶段：**v1.0.0 已正式发布**。已具备独立权重加载、Qwen ModelRunner、
 连续与 Paged KV Cache、Decode CUDA Paged Attention、batched Decode、同步
 `ContinuousBatchEngine`、Static/Continuous 调度策略、请求级指标和 clean-tree release
-evaluation。正式 release 前不再扩展功能，重点是固定证据、文档与复现入口。
+evaluation。正式版本、Release Notes 和可下载的原始证据归档见
+[GitHub Release v1.0.0](https://github.com/Eran-ovo/mini-llm-runtime/releases/tag/v1.0.0)。
 
 ## 架构主线
 
@@ -103,8 +104,8 @@ pytest
 ```
 
 单元测试不下载模型，覆盖 Prefill/Decode、Cache 事务、Paged 地址映射、Scheduler、Engine、
-benchmark 统计和 release gate。真实 Qwen correctness 由独立 CLI 执行。clean-tree release
-candidate `e01c3c7` 中全量结果为 `180 passed`。
+benchmark 统计和 release gate。真实 Qwen correctness 由独立 CLI 执行。正式版本
+`v1.0.0` 的 clean-tree 全量结果为 `182 passed`。
 
 ## 交互式学习实验
 
@@ -392,21 +393,21 @@ TORCH_CUDA_ARCH_LIST=8.6 python -m experiments.continuous_batch_engine_runner \
 ## Clean-tree 正式结果
 
 下面的数据全部来自同一个 detached clean worktree、同一 commit
-`e01c3c737a5ee55d9e14544c5108c0ae0a5b6a66`。测试包含 3 轮 warmup、多轮 measured samples、
+`d31ded234702d9f51d419d8c2d200e51c5994950`。测试包含 3 轮 warmup、多轮 measured samples、
 交错执行顺序、raw JSON/CSV、环境信息和请求级时间线。
 
 | Policy | Throughput | TTFT median | TPOT median | E2E median |
 |---|---:|---:|---:|---:|
-| Continuous | 70.67 tok/s | 183.71 ms | 25.59 ms | 418.88 ms |
-| Static | 65.33 tok/s | 331.26 ms | 24.00 ms | 475.94 ms |
+| Continuous | 71.70 tok/s | 178.08 ms | 25.56 ms | 414.06 ms |
+| Static | 65.43 tok/s | 334.78 ms | 24.06 ms | 478.58 ms |
 
-在这个固定的 8-request burst workload 中，Continuous 相对 Static：throughput `+8.18%`、
-TTFT `-44.54%`、E2E `-11.99%`，代价是 TPOT `+6.64%`（更慢）。这不是生产流量结论；它只
+在这个固定的 8-request burst workload 中，Continuous 相对 Static：throughput `+9.58%`、
+TTFT `-46.81%`、E2E `-13.48%`，代价是 TPOT `+6.23%`（更慢）。这不是生产流量结论；它只
 说明当前同步实现中，动态 refill 改善排队和整体吞吐，但 mixed Prefill 会干扰 running Decode。
 
 额外的 mixed Prefill budget 实验验证了“限制 Prefill 并不是免费优化”：budget 4 虽让 TPOT
-median 改善 `5.28%`，却使 throughput 下降 `8.75%`、TTFT p95 上升 `25.91%`、E2E p95
-上升 `15.02%`。因此该旋钮默认关闭，不作为推荐策略。tail/fairness 定义见
+median 改善 `5.32%`，却使 throughput 下降 `7.87%`、TTFT p95 上升 `24.29%`、E2E p95
+上升 `13.92%`。因此该旋钮默认关闭，不作为推荐策略。tail/fairness 定义见
 [Tail Latency 指标](docs/tail_latency_metrics.md)。
 
 Nsight Systems 的 NVTX 时间线确认当前 host 编排严格执行 `Prefill → batched Decode → D2H`；
@@ -425,9 +426,11 @@ python scripts/run_release_evaluation.py \
   --output-dir benchmarks/results/release_candidate_v1
 ```
 
-当前 release candidate bundle 的 `passed=true`，14 个文件均记录 SHA-256；manifest 自身
-SHA-256 为
-`09603b59aa6a2a8b09c5624634edd80eee8c24b11ed05f4ddb9ef3a11ca9b055`。方法、失败语义与
+`v1.0.0` 正式 bundle 的 `passed=true`，14 个文件均记录 SHA-256；manifest 自身 SHA-256 为
+`2a344b91e4c1800fb2148430ee69d3e3559a7f69365f02ac16a774f70ec9875c`。完整归档已作为
+[Release asset](https://github.com/Eran-ovo/mini-llm-runtime/releases/download/v1.0.0/mini-llm-runtime-v1.0.0-release-evidence.tar.gz)
+公开，归档 SHA-256 为
+`3252d93deca6097e38563c182609debf44b14d70c33f696506559d6c29fb5dad`。方法、失败语义与
 editable-install 陷阱见 [Clean-Tree Release Evaluation](docs/release_evaluation.md)。所有正式、
 重复、profiler、smoke 和失败实验的分类见 [证据索引](docs/evidence_index.md)。
 
