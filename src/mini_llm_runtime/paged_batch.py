@@ -60,10 +60,9 @@ class PagedBatchDecodeAdapter:
     def active(self) -> bool:
         return self._active
 
-    def build_position_ids(
-        self, *, device: torch.device | str | None = None
-    ) -> torch.Tensor:
-        """返回 `[B,1]` Decode absolute positions，即 append 前的各请求长度。"""
+    @property
+    def current_positions(self) -> tuple[int, ...]:
+        """返回 CPU metadata 中的 Decode positions，不触发 GPU 同步。"""
         positions = []
         for table in self._tables:
             if table.pending is None:
@@ -76,8 +75,16 @@ class PagedBatchDecodeAdapter:
                     f"请求 {table.request_id!r} Cache 为空，不能执行 Decode"
                 )
             positions.append(position)
+        return tuple(positions)
+
+    def build_position_ids(
+        self, *, device: torch.device | str | None = None
+    ) -> torch.Tensor:
+        """返回 `[B,1]` Decode absolute positions，即 append 前的各请求长度。"""
         target = self.device if device is None else torch.device(device)
-        return torch.tensor(positions, dtype=torch.long, device=target).unsqueeze(1)
+        return torch.tensor(
+            self.current_positions, dtype=torch.long, device=target
+        ).unsqueeze(1)
 
     def begin_decode(self) -> None:
         """为 batch 中每个请求原子开启一个单 token append。"""

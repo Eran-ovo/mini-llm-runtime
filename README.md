@@ -317,8 +317,18 @@ TORCH_CUDA_ARCH_LIST=8.6 python -m experiments.paged_batch_decode_walkthrough
 ```
 
 Batch row、RoPE position 与可读 length 的区别、跨请求事务回滚和 padding 规则见
-[多请求 Paged Decode Batch Adapter](docs/paged_batch_decode.md)。当前尚未接入完整 Qwen
-batched Decode。
+[多请求 Paged Decode Batch Adapter](docs/paged_batch_decode.md)。Adapter 现已接入完整
+Qwen ModelRunner：变长请求共享 batched QKV/MLP，并在每层只调用一次 Paged Attention。
+
+```bash
+python -m pytest -q tests/test_batched_qwen_decode.py
+TORCH_CUDA_ARCH_LIST=8.6 python -m experiments.batched_qwen_decode_runner \
+  --local-files-only
+```
+
+数据流、逐请求 position、跨层事务边界与对拍口径见
+[Qwen 多请求 Batched Decode](docs/batched_qwen_decode.md)。当前 Scheduler 尚未自动驱动
+ModelRunner，也尚未形成真实 Continuous Batching benchmark。
 
 在固定的纯 KV Cache 显存预算下，下面的确定性模拟会让连续预留和不同 block size
 处理同一批 FIFO 请求，并输出接纳请求数、block/预留区利用率、slot 利用率和内部碎片：
