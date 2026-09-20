@@ -55,6 +55,9 @@ schedule_step()
 最后统一 `.cpu().tolist()`，每个 step 只有一次结果同步。未来异步引擎还会进一步用 CUDA
 stream、event 和双缓冲隐藏这段开销，本阶段不提前实现。
 
+请求现在统一通过 `engine.submit()` 记录 arrival，并保存 first-token、逐 token 和 completion
+事件；指标定义与同步边界见 [请求级时间线](request_metrics.md)。
+
 ## 当前边界
 
 - 只支持 greedy decoding，不支持 temperature、top-k/top-p。

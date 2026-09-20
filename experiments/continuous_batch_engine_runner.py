@@ -110,7 +110,7 @@ def main() -> None:
 
     def submit(request_id: str) -> None:
         _, max_new_tokens = REQUESTS[request_id]
-        scheduler.submit(
+        engine.submit(
             request_id,
             encoded[request_id][0].cpu().tolist(),
             max_new_tokens=max_new_tokens,
@@ -172,6 +172,17 @@ def main() -> None:
         and manager.allocator.free_count == manager.allocator.total_blocks
     )
     print(f"\nall KV blocks released = {all_released}")
+    print("\n===== Request Timeline（correctness run，非 benchmark） =====")
+    for request_id in ("A", "B", "C"):
+        metrics = engine.metrics.snapshot(request_id)
+        print(
+            f"{request_id}: queue={metrics.queue_wait_ms:.3f} ms, "
+            f"TTFT={metrics.ttft_ms:.3f} ms, "
+            f"TPOT_median={metrics.median_tpot_ms}, "
+            f"E2E={metrics.e2e_ms:.3f} ms, "
+            f"post_token={metrics.post_token_completion_ms:.3f} ms, "
+            f"raw_inter_token_ns={metrics.inter_token_ns}"
+        )
     if failed or not all_released:
         raise SystemExit(
             f"Engine 对拍失败：token_mismatch={failed}, released={all_released}"

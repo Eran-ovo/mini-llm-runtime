@@ -68,8 +68,8 @@ def test_engine_runs_prefill_mixed_decode_and_releases_finished(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine, scheduler, admission = make_engine(monkeypatch)
-    scheduler.submit("A", (1, 2, 3), max_new_tokens=3)
-    scheduler.submit("B", (4, 0), max_new_tokens=1)
+    engine.submit("A", (1, 2, 3), max_new_tokens=3)
+    engine.submit("B", (4, 0), max_new_tokens=1)
 
     first = engine.step()
     assert first is not None
@@ -81,7 +81,7 @@ def test_engine_runs_prefill_mixed_decode_and_releases_finished(
     assert admission.manager.get_request("A").token_count == 3
 
     # C 在下一轮加入；该 step 同时包含旧请求 A 的 Decode 和新请求 C 的 Prefill。
-    scheduler.submit("C", (1,), max_new_tokens=2)
+    engine.submit("C", (1,), max_new_tokens=2)
     second = engine.step()
     assert second is not None
     assert [(item.request_id, item.kind) for item in second.batch.items] == [
@@ -102,6 +102,16 @@ def test_engine_runs_prefill_mixed_decode_and_releases_finished(
         admission.manager.allocator.free_count
         == admission.manager.allocator.total_blocks
     )
+    metrics_a = engine.metrics.snapshot("A")
+    metrics_b = engine.metrics.snapshot("B")
+    metrics_c = engine.metrics.snapshot("C")
+    assert len(metrics_a.token_events) == 3
+    assert len(metrics_b.token_events) == 1
+    assert len(metrics_c.token_events) == 2
+    assert len(metrics_a.inter_token_ns) == 2
+    assert metrics_b.inter_token_ns == ()
+    assert metrics_b.median_tpot_ns is None
+    assert all(item.completed_ns is not None for item in (metrics_a, metrics_b, metrics_c))
     assert engine.step() is None
 
 
@@ -109,12 +119,12 @@ def test_mixed_step_decode_failure_restores_scheduler_and_new_prefill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine, scheduler, admission = make_engine(monkeypatch)
-    scheduler.submit("A", (1, 2), max_new_tokens=3)
+    engine.submit("A", (1, 2), max_new_tokens=3)
     assert engine.step() is not None
     old_a_length = admission.manager.get_request("A").token_count
     old_free_blocks = admission.manager.allocator.free_count
 
-    scheduler.submit("B", (3,), max_new_tokens=2)
+    engine.submit("B", (3,), max_new_tokens=2)
 
     def fail_decode(*_: object, **__: object) -> torch.Tensor:
         raise RuntimeError("injected decode failure")
@@ -163,6 +173,9 @@ def test_mixed_step_decode_failure_restores_scheduler_and_new_prefill(
     assert retried.batch.prefill_request_ids == ("B",)
     assert admission.manager.get_request("A").token_count == old_a_length + 1
     assert admission.manager.get_request("B").token_count == 1
+    # 失败尝试本身也是时间线事实；没有产生虚假的 token event。
+    assert len(engine.metrics.snapshot("B").prefill_attempt_started_ns) == 2
+    assert len(engine.metrics.snapshot("B").token_events) == 1
 
 
 def test_scheduler_abort_preserves_fifo_before_new_arrivals() -> None:
