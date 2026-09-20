@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "milestone": "v0.6-continuous-batching",
+  "decision": "frozen",
+  "requirements": [
+    {
+      "id": "waiting_running_queues",
+      "description": "实现 waiting/running/finished 请求状态机",
+      "implementation": ["src/mini_llm_runtime/scheduler.py"],
+      "tests": ["tests/test_scheduler.py"],
+      "docs": ["docs/scheduler_state_machine.md"]
+    },
+    {
+      "id": "dynamic_join_leave",
+      "description": "每个 decoding step 动态接纳和移除请求",
+      "implementation": ["src/mini_llm_runtime/engine.py"],
+      "tests": ["tests/test_engine.py", "tests/test_continuous_batch_correctness_gate.py"],
+      "docs": ["docs/continuous_batch_engine.md", "docs/continuous_batch_correctness_gate.md"]
+    },
+    {
+      "id": "heterogeneous_lengths",
+      "description": "覆盖不同 prompt length 和 generation length",
+      "implementation": ["scripts/benchmark_batching_policy.py"],
+      "tests": ["tests/test_batching_policy_benchmark.py"],
+      "docs": ["docs/batching_policy_benchmark.md"]
+    },
+    {
+      "id": "policy_and_token_budget",
+      "description": "实现简单调度策略、总 token budget 和 mixed Prefill budget",
+      "implementation": ["src/mini_llm_runtime/scheduler.py", "scripts/benchmark_mixed_prefill_budget.py"],
+      "tests": ["tests/test_scheduler.py", "tests/test_mixed_prefill_budget_benchmark.py"],
+      "docs": ["docs/batching_policy.md", "docs/mixed_prefill_budget.md"]
+    },
+    {
+      "id": "static_vs_continuous_metrics",
+      "description": "对比 Static/Continuous 的吞吐、TTFT、TPOT、E2E 和显存",
+      "implementation": ["scripts/benchmark_batching_policy.py"],
+      "tests": ["tests/test_batching_policy_benchmark.py"],
+      "docs": ["docs/batching_policy_benchmark.md", "docs/tail_latency_metrics.md"]
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "static_vs_continuous_run1",
+      "classification": "formal_benchmark",
+      "path": "benchmarks/results/batching_policy_v06/result.json",
+      "sha256": "d60c8e83c1cac5a8e4c155b540764caa1f5bf4fb9a6319d0a1d739d3295c6e69",
+      "required_files": [
+        "benchmarks/results/batching_policy_v06/report.md",
+        "benchmarks/results/batching_policy_v06/trials.csv",
+        "benchmarks/results/batching_policy_v06/analysis.md"
+      ],
+      "assertions": [
+        {"path": ["schema_version"], "equals": 1},
+        {"path": ["benchmark"], "equals": "static_vs_continuous_burst_batching"},
+        {"path": ["parameters", "warmup"], "equals": 3},
+        {"path": ["parameters", "repeats"], "equals": 10},
+        {"path": ["correctness", "all_policy_token_sequences_equal"], "equals": true},
+        {"path": ["environment_after", "git_commit"], "equals": "a1b4f7e6d47da13dfe353866235d1147892a65e2"}
+      ]
+    },
+    {
+      "id": "static_vs_continuous_run2",
+      "classification": "formal_benchmark_repeat",
+      "path": "benchmarks/results/batching_policy_v06_repeat2/result.json",
+      "sha256": "39108717f278659ff360320f8537d411011fa4a155935745a437ac4d7e12522b",
+      "required_files": [
+        "benchmarks/results/batching_policy_v06_repeat2/report.md",
+        "benchmarks/results/batching_policy_v06_repeat2/trials.csv"
+      ],
+      "assertions": [
+        {"path": ["schema_version"], "equals": 1},
+        {"path": ["parameters", "warmup"], "equals": 3},
+        {"path": ["parameters", "repeats"], "equals": 10},
+        {"path": ["correctness", "all_policy_token_sequences_equal"], "equals": true},
+        {"path": ["environment_after", "git_commit"], "equals": "a1b4f7e6d47da13dfe353866235d1147892a65e2"}
+      ]
+    },
+    {
+      "id": "mixed_prefill_tail",
+      "classification": "formal_benchmark",
+      "path": "benchmarks/results/mixed_prefill_tail_v06/result.json",
+      "sha256": "8e97523e311ee3cb0062e5663bba5246f4187b9c5bdd0a529a5439da3f9fe27b",
+      "required_files": [
+        "benchmarks/results/mixed_prefill_tail_v06/report.md",
+        "benchmarks/results/mixed_prefill_tail_v06/trials.csv",
+        "benchmarks/results/mixed_prefill_tail_v06/analysis.md"
+      ],
+      "assertions": [
+        {"path": ["schema_version"], "equals": 2},
+        {"path": ["parameters", "warmup"], "equals": 3},
+        {"path": ["parameters", "repeats"], "equals": 12},
+        {"path": ["correctness", "all_budget_token_sequences_equal"], "equals": true},
+        {"path": ["environment_after", "git_commit"], "equals": "ffb2eb7679300be0b3bc4711fdac404daf1506bf"}
+      ]
+    },
+    {
+      "id": "continuous_batch_hf_correctness",
+      "classification": "formal_correctness",
+      "path": "benchmarks/results/continuous_batch_correctness_v06/result.json",
+      "sha256": "e1ce8ff97b6dfe2d0c08a3cc010b77815a013526b18f8aa335b769af691709bb",
+      "required_files": [
+        "benchmarks/results/continuous_batch_correctness_v06/report.md"
+      ],
+      "assertions": [
+        {"path": ["schema_version"], "equals": 1},
+        {"path": ["artifact"], "equals": "continuous_batching_end_to_end_correctness"},
+        {"path": ["gate", "passed"], "equals": true},
+        {"path": ["gate", "checks", "all_token_sequences_match_hf"], "equals": true},
+        {"path": ["gate", "checks", "has_batched_decode"], "equals": true},
+        {"path": ["gate", "checks", "reuses_released_physical_block"], "equals": true},
+        {"path": ["environment_after", "git_commit"], "equals": "385bdb60060de2121850bd320e5d1bd0d55a0978"}
+      ]
+    },
+    {
+      "id": "nsys_prefill_decode_interference",
+      "classification": "profiler_evidence",
+      "path": "benchmarks/results/nsys_batching_v06/analysis.md",
+      "sha256": "33759a0c7cd8d875db159f3aa600cee25caa4bc8c1d9b5b11c4d17be49d395f1",
+      "required_files": [
+        "benchmarks/results/nsys_batching_v06/continuous.nsys-rep",
+        "benchmarks/results/nsys_batching_v06/static.nsys-rep",
+        "benchmarks/results/nsys_batching_v06/continuous.sqlite",
+        "benchmarks/results/nsys_batching_v06/static.sqlite"
+      ]
+    }
+  ],
+  "known_limitations": [
+    "正式 benchmark 的 environment snapshot 记录 git_dirty=true；数据绑定到明确 commit，但不是 clean-tree release run。",
+    "Static/Continuous benchmark 使用 8-request burst arrival，不能外推到真实在线 arrival distribution。",
+    "Nsight Systems 2023.4 on WSL2 未采集到 CUDA GPU kernel timeline；只能证明 host-side NVTX 编排顺序和 CUDA API 边界。",
+    "Correctness gate 是固定短请求 workload，不能替代长上下文、更多 batch/block size 的参数化测试。",
+    "max_mixed_prefill_tokens 保持默认关闭；4/8 只作为 trade-off 实验，不是推荐配置。"
+  ]
+}
