@@ -252,6 +252,8 @@ def run_trial(
 def summarize_trials(trials: list[dict[str, Any]]) -> dict[str, Any]:
     if not trials:
         raise ValueError("至少需要一个 measured trial")
+    if any(not trial["requests"] for trial in trials):
+        raise ValueError("每个 measured trial 至少需要一个 request")
     throughput = [float(item["output_tokens_per_second"]) for item in trials]
     service_ms = [float(item["service_window_ns"]) / 1e6 for item in trials]
     cuda_ms = [float(item["cuda_timeline_total_ms"]) for item in trials]
@@ -272,7 +274,78 @@ def summarize_trials(trials: list[dict[str, Any]]) -> dict[str, Any]:
         for trial in trials
         for request in trial["requests"]
     ]
+    trial_ttft_ms = [
+        [float(request["ttft_ns"]) / 1e6 for request in trial["requests"]]
+        for trial in trials
+    ]
+    trial_tpot_ms = [
+        [
+            float(sample) / 1e6
+            for request in trial["requests"]
+            for sample in request["inter_token_ns"]
+        ]
+        for trial in trials
+    ]
+    trial_e2e_ms = [
+        [float(request["e2e_ns"]) / 1e6 for request in trial["requests"]]
+        for trial in trials
+    ]
+
+    request_order = tuple(
+        str(request["request_id"]) for request in trials[0]["requests"]
+    )
+    for trial in trials[1:]:
+        current_order = tuple(str(item["request_id"]) for item in trial["requests"])
+        if current_order != request_order:
+            raise ValueError("所有 trial 的 request 顺序必须一致")
+
+    per_request_position = []
+    for position, request_id in enumerate(request_order):
+        requests = [trial["requests"][position] for trial in trials]
+        request_tpot_ms = [
+            float(sample) / 1e6
+            for request in requests
+            for sample in request["inter_token_ns"]
+        ]
+        per_request_position.append(
+            {
+                "arrival_position": position,
+                "request_id": request_id,
+                "ttft_samples_ms": [
+                    float(request["ttft_ns"]) / 1e6 for request in requests
+                ],
+                "median_ttft_ms": float(
+                    statistics.median(
+                        float(request["ttft_ns"]) / 1e6 for request in requests
+                    )
+                ),
+                "median_tpot_ms": (
+                    float(statistics.median(request_tpot_ms))
+                    if request_tpot_ms
+                    else None
+                ),
+                "e2e_samples_ms": [
+                    float(request["e2e_ns"]) / 1e6 for request in requests
+                ],
+                "median_e2e_ms": float(
+                    statistics.median(
+                        float(request["e2e_ns"]) / 1e6 for request in requests
+                    )
+                ),
+            }
+        )
+
+    trial_p90_ttft_ms = [linear_percentile(item, 90) for item in trial_ttft_ms]
+    trial_p95_ttft_ms = [linear_percentile(item, 95) for item in trial_ttft_ms]
+    trial_max_ttft_ms = [max(item) for item in trial_ttft_ms]
+    trial_p95_tpot_ms = [
+        linear_percentile(item, 95) for item in trial_tpot_ms if item
+    ]
+    trial_p90_e2e_ms = [linear_percentile(item, 90) for item in trial_e2e_ms]
+    trial_p95_e2e_ms = [linear_percentile(item, 95) for item in trial_e2e_ms]
+    trial_max_e2e_ms = [max(item) for item in trial_e2e_ms]
     return {
+        "percentile_method": "linear interpolation; rank=(N-1)*q",
         "trial_throughput_samples_tokens_per_second": throughput,
         "median_throughput_tokens_per_second": float(statistics.median(throughput)),
         "trial_service_window_samples_ms": service_ms,
@@ -283,10 +356,82 @@ def summarize_trials(trials: list[dict[str, Any]]) -> dict[str, Any]:
         "max_peak_allocated_bytes": max(peak_bytes),
         "request_ttft_samples_ms": ttft_ms,
         "median_request_ttft_ms": float(statistics.median(ttft_ms)),
+        "trial_p90_request_ttft_samples_ms": trial_p90_ttft_ms,
+        "median_trial_p90_request_ttft_ms": float(
+            statistics.median(trial_p90_ttft_ms)
+        ),
+        "trial_p95_request_ttft_samples_ms": trial_p95_ttft_ms,
+        "median_trial_p95_request_ttft_ms": float(
+            statistics.median(trial_p95_ttft_ms)
+        ),
+        "trial_max_request_ttft_samples_ms": trial_max_ttft_ms,
+        "median_trial_max_request_ttft_ms": float(
+            statistics.median(trial_max_ttft_ms)
+        ),
+        "max_request_ttft_ms": max(ttft_ms),
         "inter_token_samples_ms": tpot_ms,
         "median_tpot_ms": float(statistics.median(tpot_ms)) if tpot_ms else None,
+        "trial_p95_tpot_samples_ms": trial_p95_tpot_ms,
+        "median_trial_p95_tpot_ms": (
+            float(statistics.median(trial_p95_tpot_ms))
+            if trial_p95_tpot_ms
+            else None
+        ),
         "request_e2e_samples_ms": e2e_ms,
         "median_request_e2e_ms": float(statistics.median(e2e_ms)),
+        "trial_p90_request_e2e_samples_ms": trial_p90_e2e_ms,
+        "median_trial_p90_request_e2e_ms": float(
+            statistics.median(trial_p90_e2e_ms)
+        ),
+        "trial_p95_request_e2e_samples_ms": trial_p95_e2e_ms,
+        "median_trial_p95_request_e2e_ms": float(
+            statistics.median(trial_p95_e2e_ms)
+        ),
+        "trial_max_request_e2e_samples_ms": trial_max_e2e_ms,
+        "median_trial_max_request_e2e_ms": float(
+            statistics.median(trial_max_e2e_ms)
+        ),
+        "max_request_e2e_ms": max(e2e_ms),
+        "per_request_position": per_request_position,
+    }
+
+
+def linear_percentile(samples: list[float], percentile: float) -> float:
+    """使用线性插值计算百分位数，避免依赖 NumPy 的隐式默认值。"""
+    if not samples:
+        raise ValueError("percentile 至少需要一个 sample")
+    if percentile < 0 or percentile > 100:
+        raise ValueError("percentile 必须位于 [0, 100]")
+    ordered = sorted(float(item) for item in samples)
+    rank = (len(ordered) - 1) * percentile / 100
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return ordered[lower]
+    fraction = rank - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def trial_tail_latency(trial: dict[str, Any]) -> dict[str, float | None]:
+    """为单个 trial 计算 tail 指标，供 CSV 保存独立原始统计量。"""
+    requests = trial["requests"]
+    if not requests:
+        raise ValueError("trial 至少需要一个 request")
+    ttft_ms = [float(item["ttft_ns"]) / 1e6 for item in requests]
+    tpot_ms = [
+        float(sample) / 1e6
+        for item in requests
+        for sample in item["inter_token_ns"]
+    ]
+    e2e_ms = [float(item["e2e_ns"]) / 1e6 for item in requests]
+    return {
+        "ttft_p90_ms": linear_percentile(ttft_ms, 90),
+        "ttft_p95_ms": linear_percentile(ttft_ms, 95),
+        "ttft_max_ms": max(ttft_ms),
+        "tpot_p95_ms": linear_percentile(tpot_ms, 95) if tpot_ms else None,
+        "e2e_p90_ms": linear_percentile(e2e_ms, 90),
+        "e2e_p95_ms": linear_percentile(e2e_ms, 95),
+        "e2e_max_ms": max(e2e_ms),
     }
 
 
@@ -317,6 +462,28 @@ def render_markdown(result: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
+            "| Policy | TTFT p90* (ms) | TTFT p95* (ms) | TTFT max (ms) | TPOT p95* (ms) | E2E p90* (ms) | E2E p95* (ms) | E2E max (ms) |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for policy in ("continuous", "static"):
+        item = result["summary"][policy]
+        tpot_p95 = item["median_trial_p95_tpot_ms"]
+        tpot_p95_text = f"{tpot_p95:.4f}" if tpot_p95 is not None else "N/A"
+        lines.append(
+            f"| {policy} | {item['median_trial_p90_request_ttft_ms']:.4f} | "
+            f"{item['median_trial_p95_request_ttft_ms']:.4f} | "
+            f"{item['max_request_ttft_ms']:.4f} | {tpot_p95_text} | "
+            f"{item['median_trial_p90_request_e2e_ms']:.4f} | "
+            f"{item['median_trial_p95_request_e2e_ms']:.4f} | "
+            f"{item['max_request_e2e_ms']:.4f} |"
+        )
+    lines.extend(
+        [
+            "",
+            "`*` 表示每个 trial 先计算 percentile，再对 trial percentile 取 median；",
+            "percentile 使用 linear interpolation，`rank=(N-1)*q`。max 是全部 measured raw samples 的最大值。",
+            "",
             "策略逐轮交错且奇偶轮反转顺序。表格来自 measured trials 的中位数；",
             "所有 trial、request、inter-token、step CUDA Event 与显存原始样本见 `result.json`。",
             "`trials.csv` 每行保存一个 policy trial，便于后续绘图。",
@@ -337,6 +504,13 @@ def write_trial_csv(path: Path, rounds: list[dict[str, Any]]) -> None:
         "peak_allocated_bytes",
         "peak_dynamic_allocated_bytes",
         "step_count",
+        "ttft_p90_ms",
+        "ttft_p95_ms",
+        "ttft_max_ms",
+        "tpot_p95_ms",
+        "e2e_p90_ms",
+        "e2e_p95_ms",
+        "e2e_max_ms",
     )
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -344,6 +518,7 @@ def write_trial_csv(path: Path, rounds: list[dict[str, Any]]) -> None:
         for round_data in rounds:
             for position, policy in enumerate(round_data["execution_order"]):
                 trial = round_data["trials"][policy]
+                tail = trial_tail_latency(trial)
                 writer.writerow(
                     {
                         "round_index": round_data["round_index"],
@@ -359,6 +534,7 @@ def write_trial_csv(path: Path, rounds: list[dict[str, Any]]) -> None:
                             "peak_dynamic_allocated_bytes"
                         ],
                         "step_count": len(trial["steps"]),
+                        **tail,
                     }
                 )
 
@@ -460,7 +636,7 @@ def main() -> None:
         )
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark": "static_vs_continuous_burst_batching",
         "model": args.model,
         "parameters": {
@@ -491,6 +667,10 @@ def main() -> None:
         "measurement_definition": {
             "throughput": "total output tokens / (last token ready - first arrival)",
             "ttft_tpot_e2e": "CPU perf_counter_ns request timeline",
+            "tail_latency": (
+                "linear percentile rank=(N-1)*q within each trial, then median "
+                "across measured trials; max spans all measured raw samples"
+            ),
             "cuda_timeline": (
                 "per-step CUDA Events on current default stream; includes device "
                 "timeline gaps (including stream idle caused by CPU orchestration) "

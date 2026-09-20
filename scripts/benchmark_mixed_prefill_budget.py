@@ -24,6 +24,7 @@ if __package__:
         parse_positive_int_list,
         run_trial,
         summarize_trials,
+        trial_tail_latency,
     )
 else:
     # `python scripts/benchmark_mixed_prefill_budget.py` 会把 scripts/ 放在
@@ -34,6 +35,7 @@ else:
         parse_positive_int_list,
         run_trial,
         summarize_trials,
+        trial_tail_latency,
     )
 
 
@@ -121,6 +123,53 @@ def render_markdown(result: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
+            "| Budget | TTFT p90* (ms) | TTFT p95* (ms) | TTFT max (ms) | TPOT p95* (ms) | E2E p90* (ms) | E2E p95* (ms) | E2E max (ms) |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for key in result["case_keys"]:
+        item = result["summary"][key]
+        tpot_p95 = item["median_trial_p95_tpot_ms"]
+        tpot_p95_text = f"{tpot_p95:.4f}" if tpot_p95 is not None else "N/A"
+        lines.append(
+            f"| {key} | {item['median_trial_p90_request_ttft_ms']:.4f} | "
+            f"{item['median_trial_p95_request_ttft_ms']:.4f} | "
+            f"{item['max_request_ttft_ms']:.4f} | {tpot_p95_text} | "
+            f"{item['median_trial_p90_request_e2e_ms']:.4f} | "
+            f"{item['median_trial_p95_request_e2e_ms']:.4f} | "
+            f"{item['max_request_e2e_ms']:.4f} |"
+        )
+
+    lines.extend(["", "## Arrival-position fairness", ""])
+    header = "| Position | Request | " + " | ".join(
+        f"{key} TTFT / E2E (ms)" for key in result["case_keys"]
+    ) + " |"
+    lines.append(header)
+    lines.append("|---:|---|" + "---:|" * len(result["case_keys"]))
+    first_summary = result["summary"][result["case_keys"][0]][
+        "per_request_position"
+    ]
+    for position_item in first_summary:
+        position = position_item["arrival_position"]
+        request_id = position_item["request_id"]
+        cells = []
+        for key in result["case_keys"]:
+            item = result["summary"][key]["per_request_position"][position]
+            if item["request_id"] != request_id:
+                raise ValueError("不同 case 的 request arrival position 不一致")
+            cells.append(
+                f"{item['median_ttft_ms']:.4f} / {item['median_e2e_ms']:.4f}"
+            )
+        lines.append(
+            f"| {position} | {request_id} | " + " | ".join(cells) + " |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "`*` 表示每个 trial 先计算 percentile，再对 trial percentile 取 median；",
+            "percentile 使用 linear interpolation，`rank=(N-1)*q`。max 是全部 measured raw samples 的最大值。",
+            "",
             "所有 case 都使用 Continuous Batching，仅改变 mixed Prefill token budget。",
             "case 顺序逐轮循环轮换；表格是 measured samples 的中位数。",
             "完整 trial、request、inter-token、step CUDA Event 与显存原始样本见 `result.json`。",
@@ -141,6 +190,13 @@ def write_trial_csv(path: Path, rounds: list[dict[str, Any]]) -> None:
         "peak_allocated_bytes",
         "peak_dynamic_allocated_bytes",
         "step_count",
+        "ttft_p90_ms",
+        "ttft_p95_ms",
+        "ttft_max_ms",
+        "tpot_p95_ms",
+        "e2e_p90_ms",
+        "e2e_p95_ms",
+        "e2e_max_ms",
     )
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -148,6 +204,7 @@ def write_trial_csv(path: Path, rounds: list[dict[str, Any]]) -> None:
         for round_data in rounds:
             for position, key in enumerate(round_data["execution_order"]):
                 trial = round_data["trials"][key]
+                tail = trial_tail_latency(trial)
                 writer.writerow(
                     {
                         "round_index": round_data["round_index"],
@@ -163,6 +220,7 @@ def write_trial_csv(path: Path, rounds: list[dict[str, Any]]) -> None:
                             "peak_dynamic_allocated_bytes"
                         ],
                         "step_count": len(trial["steps"]),
+                        **tail,
                     }
                 )
 
@@ -270,7 +328,7 @@ def main() -> None:
         )
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark": "continuous_mixed_prefill_budget",
         "model": args.model,
         "case_keys": case_keys,
@@ -303,6 +361,10 @@ def main() -> None:
         "measurement_definition": {
             "throughput": "total output tokens / (last token ready - first arrival)",
             "ttft_tpot_e2e": "CPU perf_counter_ns request timeline",
+            "tail_latency": (
+                "linear percentile rank=(N-1)*q within each trial, then median "
+                "across measured trials; max spans all measured raw samples"
+            ),
             "cuda_timeline": (
                 "per-step CUDA Events on current default stream; includes device "
                 "timeline gaps between recorded events; not sum of kernel durations"
