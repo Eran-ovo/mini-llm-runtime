@@ -12,6 +12,7 @@ from .hf_baseline import GenerationResult, HuggingFaceBaseline, StepOutput
 from .generation import GreedyGenerationOutput, greedy_generate
 from .kv_cache import ContiguousKVCache, LayerKVCache, PendingAppend
 from .paged_kv_adapter import PagedRequestKVCache
+from .paged_batch import PagedBatchDecodeAdapter
 from .paged_attention import (
     PagedAttentionReferenceOutput,
     paged_decode_attention_reference,
@@ -59,6 +60,7 @@ __all__ = [
     "FixedBlockAllocator",
     "PagedKVStorage",
     "PagedBatchMetadata",
+    "PagedBatchDecodeAdapter",
     "PagedCacheStats",
     "PagedKVCacheManager",
     "PagedRequestKVCache",

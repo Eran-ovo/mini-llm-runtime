@@ -307,6 +307,19 @@ python -m experiments.block_aware_scheduler_walkthrough
 [Block-aware Admission 学习记录](docs/block_aware_admission.md)。当前尚未实现 chunked
 prefill、按需增长/preemption 或真实 GPU Continuous Batch。
 
+多请求 Decode adapter 已能按 Scheduler 指定顺序，为不同历史长度的请求原子追加一枚
+K/V，构造 padded GPU block table，并让一次 CUDA Paged Attention 与逐请求 CUDA/Python
+reference 对拍：
+
+```bash
+python -m pytest -q tests/test_paged_batch.py
+TORCH_CUDA_ARCH_LIST=8.6 python -m experiments.paged_batch_decode_walkthrough
+```
+
+Batch row、RoPE position 与可读 length 的区别、跨请求事务回滚和 padding 规则见
+[多请求 Paged Decode Batch Adapter](docs/paged_batch_decode.md)。当前尚未接入完整 Qwen
+batched Decode。
+
 在固定的纯 KV Cache 显存预算下，下面的确定性模拟会让连续预留和不同 block size
 处理同一批 FIFO 请求，并输出接纳请求数、block/预留区利用率、slot 利用率和内部碎片：
 
