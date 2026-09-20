@@ -4,9 +4,10 @@
 `Qwen/Qwen2.5-0.5B`，主线是从可信的 Hugging Face reference 出发，逐步实现
 ModelRunner、KV Cache、Paged Attention 和 Continuous Batching。
 
-当前阶段：**v0.6 Continuous Batching correctness baseline（进行中）**。已具备独立权重
-加载、Qwen ModelRunner、连续与 Paged KV Cache、Decode CUDA Paged Attention，以及
-单请求多 token 生成闭环；当前正在固定请求状态机和调度语义，尚未接入 batched Runner。
+当前阶段：**v1.0 release candidate 收尾**。已具备独立权重加载、Qwen ModelRunner、
+连续与 Paged KV Cache、Decode CUDA Paged Attention、batched Decode、同步
+`ContinuousBatchEngine`、Static/Continuous 调度策略、请求级指标和 clean-tree release
+evaluation。正式 release 前不再扩展功能，重点是固定证据、文档与复现入口。
 
 ## 架构主线
 
@@ -33,6 +34,25 @@ ModelRunner: embedding -> decoder layers -> logits
   budget 控制工作集；释放请求时把物理 block 归还 free list。
 
 详细阶段设计见 [docs/architecture.md](docs/architecture.md)。
+
+想先建立整体认知，可直接打开交互式的
+[vLLM Runtime 全流程可视化](docs/vllm_runtime_flow.html)：它按当前代码串起请求调度、
+Prefill/Decode、Paged KV Cache、CUDA Attention 和 Continuous Batching，并标注当前同步
+Engine 的真实边界。
+
+## 当前稳定能力
+
+- Qwen2.5-0.5B FP16 greedy inference；
+- 显式分离 Prefill 与逐 token Decode；
+- GQA Paged Attention CUDA kernel，使用 block table 间接寻址与 online softmax；
+- GPU Paged KV block pool、free list、request block table、释放与复用；
+- 多请求 batched Decode 和同步 Continuous Batching Engine；
+- waiting/running/finished queue、Decode-priority、strict FIFO、token/block budget；
+- Static/Continuous 公平对比，以及 TTFT、TPOT、E2E、throughput、tail latency 和显存指标；
+- Hugging Face 外部 oracle correctness gate 与 clean-tree release artifact bundle。
+
+明确不在当前范围内：异步 CPU/GPU overlap、Chunked Prefill、preemption、量化、分布式推理、
+Speculative Decoding 和 Web Server。
 
 ## 环境
 
@@ -82,8 +102,9 @@ length 的单步 Decode + argmax 时间。每轮 Decode 都在计时区间外重
 pytest
 ```
 
-快速测试不下载模型，使用小型 fake causal LM 验证 Prefill/Decode 的边界和手写
-greedy 数据流。真实模型 smoke test 由上面的 CLI 单独执行。
+单元测试不下载模型，覆盖 Prefill/Decode、Cache 事务、Paged 地址映射、Scheduler、Engine、
+benchmark 统计和 release gate。真实 Qwen correctness 由独立 CLI 执行。clean-tree release
+candidate `e01c3c7` 中全量结果为 `180 passed`。
 
 ## 交互式学习实验
 
@@ -304,8 +325,8 @@ python -m experiments.block_aware_scheduler_walkthrough
 ```
 
 原子预留、资源阻塞、完成释放及其利用率代价见
-[Block-aware Admission 学习记录](docs/block_aware_admission.md)。当前尚未实现 chunked
-prefill、按需增长/preemption 或真实 GPU Continuous Batch。
+[Block-aware Admission 学习记录](docs/block_aware_admission.md)。当前仍未实现 chunked
+prefill 和按需增长/preemption；保守预留策略已经接入真实 GPU Continuous Batch Engine。
 
 多请求 Decode adapter 已能按 Scheduler 指定顺序，为不同历史长度的请求原子追加一枚
 K/V，构造 padded GPU block table，并让一次 CUDA Paged Attention 与逐请求 CUDA/Python
@@ -327,8 +348,9 @@ TORCH_CUDA_ARCH_LIST=8.6 python -m experiments.batched_qwen_decode_runner \
 ```
 
 数据流、逐请求 position、跨层事务边界与对拍口径见
-[Qwen 多请求 Batched Decode](docs/batched_qwen_decode.md)。当前 Scheduler 尚未自动驱动
-ModelRunner，也尚未形成真实 Continuous Batching benchmark。
+[Qwen 多请求 Batched Decode](docs/batched_qwen_decode.md)。Scheduler、ModelRunner、Paged KV
+和 block admission 已由 `ContinuousBatchEngine` 串成稳定同步入口，并完成真实 Qwen
+correctness 与 Static/Continuous benchmark。
 
 在固定的纯 KV Cache 显存预算下，下面的确定性模拟会让连续预留和不同 block size
 处理同一批 FIFO 请求，并输出接纳请求数、block/预留区利用率、slot 利用率和内部碎片：
@@ -349,6 +371,66 @@ GPU kernel，因此其结果不能用于声称 Paged Attention 更快，不需�
 warmup。原始请求长度、首个被拒请求、完整配置、环境与 Git commit 会保存在
 `result.json` 中。
 
+## Continuous Batching Engine
+
+Engine 在每个 step 先执行新请求的逐请求 Prefill，再把已有 running 请求合并成一次 batched
+Decode，最后只进行一次 token D2H 同步、原子写回 Scheduler，并释放完成请求的 KV blocks。
+这个顺序为失败回滚提供明确事务边界，但也意味着 mixed step 中 Prefill 会阻塞已有请求的
+下一次 Decode。
+
+真实 Qwen HF 对拍会强制命中 late admission、mixed step、batched Decode、跨 block sequence、
+物理 block 复用和最终资源释放：
+
+```bash
+TORCH_CUDA_ARCH_LIST=8.6 python -m experiments.continuous_batch_engine_runner \
+  --local-files-only \
+  --output-dir benchmarks/results/continuous_batch_correctness_v06
+```
+
+完整 gate 定义见 [Continuous Batching 端到端正确性](docs/continuous_batch_correctness_gate.md)。
+
+## Clean-tree 正式结果
+
+下面的数据全部来自同一个 detached clean worktree、同一 commit
+`e01c3c737a5ee55d9e14544c5108c0ae0a5b6a66`。测试包含 3 轮 warmup、多轮 measured samples、
+交错执行顺序、raw JSON/CSV、环境信息和请求级时间线。
+
+| Policy | Throughput | TTFT median | TPOT median | E2E median |
+|---|---:|---:|---:|---:|
+| Continuous | 70.67 tok/s | 183.71 ms | 25.59 ms | 418.88 ms |
+| Static | 65.33 tok/s | 331.26 ms | 24.00 ms | 475.94 ms |
+
+在这个固定的 8-request burst workload 中，Continuous 相对 Static：throughput `+8.18%`、
+TTFT `-44.54%`、E2E `-11.99%`，代价是 TPOT `+6.64%`（更慢）。这不是生产流量结论；它只
+说明当前同步实现中，动态 refill 改善排队和整体吞吐，但 mixed Prefill 会干扰 running Decode。
+
+额外的 mixed Prefill budget 实验验证了“限制 Prefill 并不是免费优化”：budget 4 虽让 TPOT
+median 改善 `5.28%`，却使 throughput 下降 `8.75%`、TTFT p95 上升 `25.91%`、E2E p95
+上升 `15.02%`。因此该旋钮默认关闭，不作为推荐策略。tail/fairness 定义见
+[Tail Latency 指标](docs/tail_latency_metrics.md)。
+
+Nsight Systems 的 NVTX 时间线确认当前 host 编排严格执行 `Prefill → batched Decode → D2H`；
+但 WSL2 下的 Nsight Systems 2023.4 没有采集到 CUDA GPU kernel timeline，因此不能声称观察到
+kernel overlap、SM 利用率或 device idle。完整边界见
+[Prefill/Decode Interference 分析](docs/nsys_batching_profile.md)。
+
+## 可复现 Release Evaluation
+
+一键入口会从当前 `HEAD` 创建临时 detached clean worktree，显式覆盖 editable-install
+`PYTHONPATH`，依次运行全量测试、HF correctness、Static/Continuous benchmark 和 tail
+benchmark。主工作区的未提交文件不会被 stash、reset 或提交。
+
+```bash
+python scripts/run_release_evaluation.py \
+  --output-dir benchmarks/results/release_candidate_v1
+```
+
+当前 release candidate bundle 的 `passed=true`，14 个文件均记录 SHA-256；manifest 自身
+SHA-256 为
+`09603b59aa6a2a8b09c5624634edd80eee8c24b11ed05f4ddb9ef3a11ca9b055`。方法、失败语义与
+editable-install 陷阱见 [Clean-Tree Release Evaluation](docs/release_evaluation.md)。所有正式、
+重复、profiler、smoke 和失败实验的分类见 [证据索引](docs/evidence_index.md)。
+
 ## 目录
 
 ```text
@@ -358,6 +440,7 @@ mini-llm-runtime/
 ├── tests/                  # 无网络快速正确性测试
 ├── benchmarks/results/     # 正式结果（默认不提交）
 ├── docs/                   # 架构与阶段验收标准
+├── milestones/             # 里程碑需求与 artifact 白名单
 ├── pyproject.toml
 └── README.md
 ```

@@ -63,14 +63,19 @@ CUDA 地址计算，无法有效定位。
 - token/block budget、请求完成和 cache 回收行为均有确定性测试。
 - 与 Static Batching 在同一 workload 下比较 TTFT、TPOT、吞吐和显存。
 
-当前已完成第一小步的同步 CPU 状态机与 token budget baseline，详见
-[Scheduler 状态机学习记录](scheduler_state_machine.md)。保守的完整生命周期
-[block-aware admission](block_aware_admission.md) 也已完成；batched ModelRunner、按需
-block 增长/preemption 和性能对比仍未实现。多请求 Cache/metadata 与 CUDA Attention
-已经由独立 [Paged Decode batch adapter](paged_batch_decode.md) 打通，下一步接入 Qwen。
+v0.6 已完成并冻结：Scheduler、block-aware admission、batched Qwen Decode 和同步
+`ContinuousBatchEngine` 已形成真实 GPU 闭环；HF 外部 oracle、Static/Continuous 正式
+benchmark、tail/fairness 和 NVTX profiler 证据均已归档。验收白名单和限制见
+[v0.6 验收记录](v06_acceptance.md)。按需 block 增长、preemption、chunked prefill 与异步
+CPU/GPU overlap 不属于该里程碑。
 
 ### v1.0 收尾
 
 - README、架构图、测试矩阵、机器可读与 Markdown benchmark 全部可复现。
 - Nsight Systems/Compute 分析能解释主要瓶颈，并记录有价值的失败实验。
 - 简历数字只引用仓库内正式结果；创建 release 前稳定入口通过全部测试。
+
+当前已有 clean-tree release candidate：detached worktree 中全量测试、HF correctness、两套
+正式 benchmark 均通过，所有 artifact 绑定同一 commit 且 `git_dirty=false`。复现方法见
+[Clean-Tree Release Evaluation](release_evaluation.md)；下一步只整理 README、证据索引、
+失败实验与最终 release 说明，不再增加 Runtime 功能。

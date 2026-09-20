@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mini vLLM Runtime · 全流程可视化</title>
+  <meta name="description" content="基于当前 mini-llm-runtime 源码的交互式架构与执行流程说明" />
+  <style>
+    :root {
+      --bg: #f3f0e8;
+      --paper: #fffdf7;
+      --ink: #16211f;
+      --muted: #65716d;
+      --line: #d7d8cf;
+      --green: #166c56;
+      --green-soft: #dcebe2;
+      --orange: #c65c2d;
+      --orange-soft: #fae4d5;
+      --blue: #286a83;
+      --blue-soft: #ddecf0;
+      --yellow: #e7b94c;
+      --red: #a94442;
+      --shadow: 0 14px 36px rgba(26, 37, 33, .09);
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 8% 0%, rgba(22,108,86,.10), transparent 30rem),
+        radial-gradient(circle at 94% 18%, rgba(198,92,45,.09), transparent 26rem),
+        var(--bg);
+      font-family: var(--sans);
+      line-height: 1.65;
+    }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    a { color: var(--green); }
+    code { font-family: var(--mono); font-size: .9em; }
+    .shell { width: min(1180px, calc(100% - 36px)); margin: 0 auto; }
+    .topbar {
+      position: sticky; top: 0; z-index: 20;
+      border-bottom: 1px solid rgba(215,216,207,.9);
+      background: rgba(243,240,232,.88); backdrop-filter: blur(18px);
+    }
+    .topbar .shell { min-height: 58px; display: flex; align-items: center; gap: 18px; }
+    .brand { font-weight: 850; letter-spacing: -.03em; white-space: nowrap; }
+    .brand i { color: var(--orange); font-style: normal; }
+    .nav { display: flex; gap: 3px; overflow-x: auto; margin-left: auto; scrollbar-width: none; }
+    .nav a { color: var(--muted); text-decoration: none; padding: 7px 10px; border-radius: 8px; font-size: 13px; white-space: nowrap; }
+    .nav a:hover, .nav a.active { color: var(--ink); background: rgba(255,255,255,.72); }
+
+    .hero { padding: 76px 0 54px; }
+    .eyebrow { display: flex; align-items: center; gap: 10px; color: var(--green); font: 700 12px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    .eyebrow::before { content: ""; width: 28px; height: 2px; background: var(--green); }
+    h1 { max-width: 880px; margin: 22px 0 16px; font-size: clamp(44px, 7vw, 82px); line-height: .98; letter-spacing: -.065em; }
+    .hero-copy { max-width: 760px; font-size: clamp(17px, 2vw, 21px); color: var(--muted); }
+    .hero-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 30px; }
+    .pill { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: rgba(255,253,247,.72); border-radius: 999px; padding: 8px 12px; font-size: 13px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px var(--green-soft); }
+    .dot.orange { background: var(--orange); box-shadow: 0 0 0 4px var(--orange-soft); }
+    .headline-grid { display: grid; grid-template-columns: 1.3fr .7fr; gap: 18px; margin-top: 42px; }
+    .summary, .status-card { border: 1px solid var(--line); background: rgba(255,253,247,.86); box-shadow: var(--shadow); border-radius: 22px; }
+    .summary { padding: 28px; }
+    .summary strong { font-size: 20px; }
+    .summary p { margin: 8px 0 0; color: var(--muted); }
+    .status-card { overflow: hidden; }
+    .status-card .head { padding: 16px 20px; border-bottom: 1px solid var(--line); font-weight: 750; }
+    .status-list { list-style: none; padding: 8px 20px 12px; margin: 0; }
+    .status-list li { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; font-size: 14px; }
+    .check { color: var(--green); font-weight: 900; }
+    .progress { color: var(--orange); font-weight: 900; }
+
+    section { scroll-margin-top: 76px; padding: 62px 0; }
+    .section-head { display: grid; grid-template-columns: .38fr .62fr; gap: 28px; align-items: end; margin-bottom: 28px; }
+    .kicker { color: var(--orange); font: 800 12px/1 var(--mono); letter-spacing: .09em; text-transform: uppercase; }
+    h2 { margin: 10px 0 0; font-size: clamp(31px, 4vw, 51px); line-height: 1.04; letter-spacing: -.045em; }
+    .section-intro { color: var(--muted); font-size: 17px; margin: 0; }
+    .panel { border: 1px solid var(--line); background: var(--paper); border-radius: 22px; box-shadow: var(--shadow); padding: 24px; }
+
+    /* Architecture */
+    .architecture { display: grid; grid-template-columns: 1fr 54px 1fr 54px 1.1fr; gap: 10px; align-items: stretch; }
+    .arch-stage { position: relative; padding: 22px; border-radius: 18px; border: 1px solid var(--line); background: #fff; min-height: 260px; }
+    .arch-stage.core { background: #173d35; color: white; border-color: #173d35; }
+    .arch-stage small { color: var(--muted); font: 700 11px/1 var(--mono); letter-spacing: .06em; }
+    .arch-stage.core small { color: #aed3c8; }
+    .arch-stage h3 { margin: 13px 0 16px; font-size: 23px; }
+    .arch-stage ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: 14px; }
+    .arch-stage.core ul { color: #d9e9e4; }
+    .arch-stage li + li { margin-top: 8px; }
+    .arrow { display: grid; place-items: center; color: var(--orange); font-size: 27px; }
+    .mini-flow { display: grid; gap: 8px; }
+    .mini-node { border: 1px solid rgba(255,255,255,.22); background: rgba(255,255,255,.08); border-radius: 10px; padding: 9px 11px; font-size: 13px; }
+    .arch-caption { grid-column: 1/-1; display: flex; flex-wrap: wrap; gap: 8px; padding-top: 8px; }
+    .legend { border-radius: 999px; padding: 6px 10px; font-size: 12px; border: 1px solid var(--line); background: white; }
+    .legend.done { color: var(--green); }
+    .legend.bridge { color: var(--orange); }
+
+    /* Stepper */
+    .stepper { display: grid; grid-template-columns: 290px 1fr; gap: 22px; }
+    .step-list { display: grid; gap: 8px; align-content: start; }
+    .step-button { width: 100%; display: flex; align-items: center; gap: 12px; text-align: left; border: 1px solid transparent; background: transparent; color: var(--muted); padding: 11px 12px; border-radius: 12px; cursor: pointer; font: inherit; }
+    .step-button:hover { background: rgba(255,255,255,.6); }
+    .step-button.active { color: var(--ink); background: var(--paper); border-color: var(--line); box-shadow: 0 7px 18px rgba(26,37,33,.06); }
+    .step-num { flex: 0 0 32px; height: 32px; display: grid; place-items: center; border-radius: 10px; background: #e4e3db; font: 800 12px/1 var(--mono); }
+    .step-button.active .step-num { color: white; background: var(--orange); }
+    .step-detail { min-height: 360px; position: relative; overflow: hidden; }
+    .step-detail::after { content: attr(data-watermark); position: absolute; right: 16px; bottom: -36px; color: rgba(22,108,86,.055); font: 900 170px/1 var(--mono); pointer-events: none; }
+    .step-detail h3 { margin: 0; font-size: 30px; letter-spacing: -.025em; }
+    .step-detail .tag { display: inline-block; margin: 12px 0 20px; color: var(--green); background: var(--green-soft); border-radius: 7px; padding: 4px 8px; font: 700 11px/1.4 var(--mono); }
+    .step-detail p { max-width: 740px; color: var(--muted); }
+    .io-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 22px; position: relative; z-index: 1; }
+    .io { padding: 15px; background: #f5f4ed; border-radius: 12px; }
+    .io b { display: block; color: var(--ink); font: 750 11px/1 var(--mono); text-transform: uppercase; letter-spacing: .07em; margin-bottom: 8px; }
+    .io code { color: var(--blue); word-break: break-word; }
+    .source-link { position: relative; z-index: 2; display: inline-flex; margin-top: 22px; text-decoration: none; font-size: 13px; font-weight: 750; }
+
+    /* Dual path */
+    .tabs { display: flex; gap: 8px; margin-bottom: 18px; }
+    .tab { border: 1px solid var(--line); border-radius: 999px; background: transparent; color: var(--muted); padding: 9px 15px; cursor: pointer; font: 700 13px/1 var(--sans); }
+    .tab.active { background: var(--ink); color: white; border-color: var(--ink); }
+    .path-wrap { display: none; }
+    .path-wrap.active { display: block; }
+    .path { display: grid; grid-template-columns: repeat(7, 1fr); align-items: center; gap: 7px; }
+    .path-node { min-height: 108px; display: grid; place-items: center; align-content: center; text-align: center; border-radius: 14px; border: 1px solid var(--line); background: #fff; padding: 10px; font-size: 13px; }
+    .path-node strong { display: block; margin-bottom: 6px; }
+    .path-node code { color: var(--blue); font-size: 11px; }
+    .path-node.hot { color: white; background: var(--green); border-color: var(--green); }
+    .path-node.cache { background: var(--orange-soft); border-color: #e5ad8d; }
+    .path-arrow { text-align: center; color: var(--orange); font-weight: 900; }
+    .path-note { margin: 20px 0 0; color: var(--muted); }
+
+    /* Layer */
+    .layer-flow { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
+    .layer-box { border-radius: 14px; min-height: 130px; padding: 17px; border: 1px solid var(--line); background: #fff; }
+    .layer-box .n { color: var(--orange); font: 800 11px/1 var(--mono); }
+    .layer-box h4 { margin: 11px 0 7px; }
+    .layer-box p { margin: 0; color: var(--muted); font-size: 13px; }
+    .layer-box.attn { background: var(--blue-soft); border-color: #a9cbd4; }
+    .layer-box.mlp { background: var(--green-soft); border-color: #afd1c1; }
+    .layer-formula { margin-top: 15px; display: flex; flex-wrap: wrap; gap: 8px; }
+    .formula { background: #16211f; color: #dff5ed; border-radius: 9px; padding: 8px 11px; font: 12px/1.3 var(--mono); }
+
+    /* Cache map */
+    .cache-lab { display: grid; grid-template-columns: .9fr 1.1fr; gap: 20px; }
+    .token-strip, .block-pool { display: flex; flex-wrap: wrap; gap: 6px; }
+    .token { min-width: 42px; height: 42px; display: grid; place-items: center; border-radius: 9px; background: var(--green-soft); color: var(--green); font: 800 12px/1 var(--mono); cursor: pointer; border: 2px solid transparent; }
+    .token:hover, .token.active { border-color: var(--orange); background: var(--orange-soft); color: var(--orange); }
+    .block { width: 86px; border: 1px solid var(--line); border-radius: 12px; background: #fff; overflow: hidden; transition: .2s ease; }
+    .block.active { transform: translateY(-4px); border-color: var(--orange); box-shadow: 0 9px 20px rgba(198,92,45,.15); }
+    .block-id { padding: 7px; background: #ecebe4; text-align: center; font: 800 11px/1 var(--mono); }
+    .slots { display: grid; grid-template-columns: repeat(3,1fr); }
+    .slot { height: 36px; display: grid; place-items: center; border-right: 1px solid var(--line); font: 11px/1 var(--mono); color: var(--muted); }
+    .slot:last-child { border: 0; }
+    .slot.used { background: var(--green-soft); color: var(--green); }
+    .slot.target { background: var(--orange); color: white; }
+    .mapping-readout { margin-top: 14px; min-height: 58px; background: #16211f; color: #dff5ed; border-radius: 10px; padding: 11px 13px; font: 12px/1.55 var(--mono); }
+    .tensor-shape { display: grid; gap: 10px; }
+    .shape-row { display: grid; grid-template-columns: 155px 1fr; gap: 12px; align-items: center; }
+    .shape-row span { color: var(--muted); font-size: 13px; }
+    .shape { padding: 10px 12px; border-radius: 9px; background: #f0efe7; color: var(--blue); font: 12px/1.4 var(--mono); overflow-x: auto; }
+
+    /* Simulation */
+    .sim-grid { display: grid; grid-template-columns: .72fr 1.28fr; gap: 18px; }
+    .sim-controls { display: flex; gap: 8px; margin: 18px 0 14px; }
+    .sim-btn { border: 0; border-radius: 10px; padding: 10px 14px; cursor: pointer; font-weight: 750; color: white; background: var(--green); }
+    .sim-btn.secondary { color: var(--ink); background: #e5e4dc; }
+    .queues { display: grid; gap: 10px; }
+    .queue { min-height: 52px; padding: 8px; display: flex; align-items: center; gap: 7px; border: 1px dashed #bfc2b8; border-radius: 11px; }
+    .queue-label { width: 66px; color: var(--muted); font: 700 10px/1 var(--mono); }
+    .request { padding: 8px 10px; border-radius: 8px; background: var(--blue-soft); color: var(--blue); font: 800 11px/1 var(--mono); }
+    .request.run { background: var(--green-soft); color: var(--green); }
+    .request.finish { background: #e6e6e0; color: #747870; text-decoration: line-through; }
+    .timeline { display: grid; gap: 8px; }
+    .tick { display: grid; grid-template-columns: 68px 1fr; gap: 12px; align-items: center; opacity: .34; transition: .2s ease; }
+    .tick.past { opacity: .7; }
+    .tick.current { opacity: 1; transform: translateX(4px); }
+    .tick-label { font: 800 11px/1 var(--mono); color: var(--muted); }
+    .tick-work { min-height: 50px; display: flex; align-items: center; gap: 7px; border-radius: 11px; background: #f0efe8; padding: 8px; }
+    .work { border-radius: 7px; padding: 8px 9px; font: 750 11px/1 var(--mono); }
+    .work.prefill { background: var(--orange-soft); color: var(--orange); }
+    .work.decode { background: var(--green-soft); color: var(--green); }
+    .budget { margin-left: auto; color: var(--muted); font: 11px/1 var(--mono); }
+    .sim-note { color: var(--muted); font-size: 13px; }
+
+    /* Matrix */
+    .matrix { width: 100%; border-collapse: collapse; font-size: 14px; }
+    .matrix th, .matrix td { text-align: left; padding: 13px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    .matrix th { color: var(--muted); font: 700 11px/1 var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+    .matrix tr:last-child td { border: 0; }
+    .badge { display: inline-block; border-radius: 999px; padding: 4px 8px; font: 750 10px/1 var(--mono); white-space: nowrap; }
+    .badge.done { background: var(--green-soft); color: var(--green); }
+    .badge.partial { background: var(--orange-soft); color: var(--orange); }
+    .badge.future { background: #e8e8e2; color: #6f746c; }
+    .file { font-family: var(--mono); font-size: 12px; text-decoration: none; }
+
+    .callout { margin-top: 20px; display: grid; grid-template-columns: 36px 1fr; gap: 13px; border-left: 3px solid var(--orange); background: var(--orange-soft); border-radius: 0 12px 12px 0; padding: 15px 18px; }
+    .callout .icon { font-size: 22px; }
+    .callout p { margin: 0; color: #6c4a39; }
+    .invariants { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .invariant { background: var(--paper); border: 1px solid var(--line); border-radius: 16px; padding: 18px; }
+    .invariant b { display: block; margin-bottom: 8px; }
+    .invariant p { margin: 0; color: var(--muted); font-size: 13px; }
+
+    footer { padding: 44px 0 70px; color: var(--muted); font-size: 13px; }
+    footer .shell { padding-top: 22px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 20px; }
+
+    @media (max-width: 900px) {
+      .headline-grid, .section-head, .stepper, .cache-lab, .sim-grid { grid-template-columns: 1fr; }
+      .architecture { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); min-height: 36px; }
+      .path { grid-template-columns: 1fr; }
+      .path-arrow { transform: rotate(90deg); }
+      .layer-flow { grid-template-columns: 1fr 1fr; }
+      .invariants { grid-template-columns: 1fr 1fr; }
+      .step-list { grid-template-columns: 1fr 1fr; }
+      .step-detail { min-height: 390px; }
+    }
+    @media (max-width: 580px) {
+      .shell { width: min(100% - 22px, 1180px); }
+      .hero { padding-top: 50px; }
+      .topbar .shell { min-height: 52px; }
+      .nav { display: none; }
+      .step-list, .io-grid, .layer-flow, .invariants { grid-template-columns: 1fr; }
+      .panel { padding: 17px; }
+      .step-detail::after { font-size: 110px; }
+      .shape-row { grid-template-columns: 1fr; gap: 4px; }
+      .matrix { min-width: 720px; }
+      .table-scroll { overflow-x: auto; }
+      footer .shell { display: block; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="shell">
+      <div class="brand">mini·<i>vLLM</i> runtime</div>
+      <nav class="nav" aria-label="页面导航">
+        <a href="#overview">总览</a><a href="#lifecycle">生命周期</a><a href="#compute">计算路径</a>
+        <a href="#cache">Paged KV</a><a href="#batching">连续批处理</a><a href="#code-map">代码地图</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <div class="shell hero">
+      <div class="eyebrow">source-aware walkthrough · 2026-09-20</div>
+      <h1>一个请求，如何穿过<br>这套 mini vLLM？</h1>
+      <p class="hero-copy">从 token 进入等待队列，到 Scheduler 组批、Qwen Decoder 计算、Paged KV Cache 间接寻址，再到生成 token 与回收显存——这是一份严格对应当前仓库代码的全流程地图。</p>
+      <div class="hero-meta">
+        <span class="pill"><span class="dot"></span>Qwen2.5-0.5B · 单 GPU</span>
+        <span class="pill"><span class="dot"></span>release evidence · <code>e01c3c7</code></span>
+        <span class="pill"><span class="dot orange"></span>v1.0 · RC 收尾</span>
+      </div>
+      <div class="headline-grid">
+        <div class="summary">
+          <strong>一句话理解</strong>
+          <p>Scheduler 决定“这一轮算谁”，ModelRunner 决定“怎么算”，PagedKVCacheManager 决定“历史 K/V 放哪里”；Decode 时 CUDA Paged Attention 通过 block table 直接读取离散物理块，避免把历史 Cache 拼成连续 tensor。</p>
+        </div>
+        <div class="status-card">
+          <div class="head">当前真实边界</div>
+          <ul class="status-list">
+            <li><span class="check">✓</span><span>单请求 Prefill / 多 token Decode 闭环</span></li>
+            <li><span class="check">✓</span><span>多请求 batched Paged Decode</span></li>
+            <li><span class="check">✓</span><span>Scheduler + block-aware admission</span></li>
+            <li><span class="check">✓</span><span>同步 ContinuousBatchEngine 已串通完整生命周期</span></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+    <section id="overview">
+      <div class="shell">
+        <div class="section-head">
+          <div><div class="kicker">01 · Big Picture</div><h2>三条控制线</h2></div>
+          <p class="section-intro">不要把它理解成一个巨大的 forward。整个 runtime 分成控制面、计算面和存储面；三者通过明确的 request 顺序、token budget 与 block table 契约协作。</p>
+        </div>
+        <div class="panel architecture">
+          <div class="arch-stage">
+            <small>CONTROL PLANE · CPU</small><h3>请求与调度</h3>
+            <ul><li>RequestState 保存 prompt、输出、状态</li><li>waiting / running / finished 队列</li><li>Decode 优先、whole-prefill、严格 FIFO</li><li>token budget + running slots</li></ul>
+          </div>
+          <div class="arrow">→</div>
+          <div class="arch-stage core">
+            <small>COMPUTE PLANE · GPU</small><h3>Qwen ModelRunner</h3>
+            <div class="mini-flow"><div class="mini-node">Embedding + Position</div><div class="mini-node">24 × Decoder Layer</div><div class="mini-node">Final RMSNorm + LM Head</div><div class="mini-node">argmax → next token</div></div>
+          </div>
+          <div class="arrow">↔</div>
+          <div class="arch-stage">
+            <small>MEMORY PLANE · CPU + GPU</small><h3>Paged KV Cache</h3>
+            <ul><li>CPU：allocator / request block table</li><li>GPU：多层 K/V physical block pool</li><li>事务：begin → write layers → commit</li><li>结束：release → blocks 回 free list</li></ul>
+          </div>
+          <div class="arch-caption">
+            <span class="legend done">● 控制面、计算面、存储面已集成并测试</span>
+            <span class="legend bridge">● 当前边界：同步执行，不含 preemption / chunked prefill</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="lifecycle">
+      <div class="shell">
+        <div class="section-head">
+          <div><div class="kicker">02 · Lifecycle</div><h2>一次请求的 7 站</h2></div>
+          <p class="section-intro">点击左侧步骤查看每一站的输入、输出与代码落点。这里展示当前同步 Engine 已实际执行的请求生命周期，而不是未来设计草图。</p>
+        </div>
+        <div class="stepper">
+          <div class="step-list" id="stepList"></div>
+          <article class="panel step-detail" id="stepDetail" data-watermark="01"></article>
+        </div>
+      </div>
+    </section>
+
+    <section id="compute">
+      <div class="shell">
+        <div class="section-head">
+          <div><div class="kicker">03 · Compute</div><h2>Prefill 与 Decode</h2></div>
+          <p class="section-intro">同一个 Decoder，两种完全不同的工作负载。Prefill 一次吞下整段 prompt；Decode 每个请求只推进一个 token，并复用此前的 KV。</p>
+        </div>
+        <div class="panel">
+          <div class="tabs"><button class="tab active" data-tab="prefill">Prefill · 建立上下文</button><button class="tab" data-tab="decode">Decode · 逐 token 生成</button></div>
+          <div class="path-wrap active" id="prefill">
+            <div class="path">
+              <div class="path-node"><strong>Prompt IDs</strong><code>[1, S]</code></div><div class="path-arrow">→</div>
+              <div class="path-node hot"><strong>Embedding</strong><code>[1,S,H]</code></div><div class="path-arrow">→</div>
+              <div class="path-node"><strong>24 层 Decoder</strong><code>causal mask</code></div><div class="path-arrow">→</div>
+              <div class="path-node cache"><strong>写入 K/V</strong><code>S tokens / layer</code></div>
+            </div>
+            <p class="path-note">每层先计算 Q/K/V 和 RoPE，再把 K/V 写入该请求的 pending slots。全部层成功后才 commit；最后位置 logits 经 argmax 直接产生第一个输出 token，所以首 token 不需要额外 Decode。</p>
+          </div>
+          <div class="path-wrap" id="decode">
+            <div class="path">
+              <div class="path-node"><strong>Last Token</strong><code>[B,1]</code></div><div class="path-arrow">→</div>
+              <div class="path-node hot"><strong>Q/K/V + RoPE</strong><code>position=old_len</code></div><div class="path-arrow">→</div>
+              <div class="path-node cache"><strong>Paged Attention</strong><code>read len=old_len+1</code></div><div class="path-arrow">→</div>
+              <div class="path-node"><strong>Next Logits</strong><code>[B,1,V]</code></div>
+            </div>
+            <p class="path-note">不同请求可以有不同历史长度。当前 token 的 RoPE 位置是追加前长度；Attention 的可读长度是追加后长度。每一层只 launch 一次 batched Paged Attention，而不是每请求一次。</p>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:18px">
+          <div class="kicker">Inside one decoder layer</div>
+          <h3 style="font-size:27px;margin:12px 0 20px">一层 Qwen 到底做了什么</h3>
+          <div class="layer-flow">
+            <div class="layer-box"><div class="n">01</div><h4>RMSNorm</h4><p>先归一化，再进入注意力分支；原输入保留为 residual。</p></div>
+            <div class="layer-box attn"><div class="n">02</div><h4>Self Attention</h4><p>Q/K/V projection → RoPE → GQA → Paged Attention → O projection。</p></div>
+            <div class="layer-box"><div class="n">03</div><h4>Residual Add</h4><p>Attention 输出与进入本层时的 hidden state 相加。</p></div>
+            <div class="layer-box mlp"><div class="n">04</div><h4>RMSNorm + SwiGLU</h4><p>SiLU(gate) × up，再经 down projection 回到 hidden size。</p></div>
+            <div class="layer-box"><div class="n">05</div><h4>Residual Add</h4><p>形成下一层输入；同一结构重复 24 次。</p></div>
+          </div>
+          <div class="layer-formula"><span class="formula">kv_head = q_head // (Hq / Hkv)</span><span class="formula">attention_scale = 1 / √head_dim</span><span class="formula">K cache 保存 RoPE(K)，V cache 保存 V</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="cache">
+      <div class="shell">
+        <div class="section-head">
+          <div><div class="kicker">04 · Memory</div><h2>Paged KV 怎么寻址</h2></div>
+          <p class="section-intro">逻辑上每个请求的 token 连续；物理上它们可以散落在 GPU block pool。点击逻辑 token，观察两次除法如何落到真实物理槽位。</p>
+        </div>
+        <div class="panel cache-lab">
+          <div>
+            <div class="kicker">Request A · block_size = 3</div>
+            <h3 style="margin:12px 0 13px">逻辑 token</h3>
+            <div class="token-strip" id="tokenStrip"></div>
+            <div class="mapping-readout" id="mappingReadout"></div>
+            <p style="color:var(--muted);font-size:13px">Request A 的 block table = <code>[2, 0, 5]</code>。因此逻辑相邻不要求物理相邻。</p>
+          </div>
+          <div>
+            <div class="kicker">GPU physical block pool</div>
+            <h3 style="margin:12px 0 13px">物理块</h3>
+            <div class="block-pool" id="blockPool"></div>
+          </div>
+        </div>
+        <div class="panel" style="margin-top:18px">
+          <div class="tensor-shape">
+            <div class="shape-row"><span>完整 GPU storage</span><div class="shape">[layer, physical_block, kv_head, block_offset, head_dim]</div></div>
+            <div class="shape-row"><span>单层 CUDA 输入</span><div class="shape">query [B,Hq,D] + K/V [blocks,Hkv,block_size,D]</div></div>
+            <div class="shape-row"><span>批量地址元数据</span><div class="shape">block_table [B,max_blocks] + sequence_lengths [B]</div></div>
+          </div>
+          <div class="callout"><div class="icon">↯</div><p><strong>为什么需要事务？</strong> 一次 token 会在所有 24 层写 K/V。若第 17 层失败，前 16 层已经写过的字节必须保持不可见；所以先 <code>begin_append</code>，全层成功才 <code>commit</code>，失败就 <code>abort</code>。</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="batching">
+      <div class="shell">
+        <div class="section-head">
+          <div><div class="kicker">05 · Scheduling</div><h2>Continuous Batching</h2></div>
+          <p class="section-intro">Batch 不是固定不变的。每个 step 都先保障正在生成的请求 Decode 一次，再用剩余 token budget 从 waiting 队首接纳完整 prompt。</p>
+        </div>
+        <div class="panel sim-grid">
+          <div>
+            <div class="kicker">interactive scheduler</div>
+            <h3 style="font-size:27px;margin:12px 0 6px">step <span id="stepIndex">0</span> / 4</h3>
+            <p class="sim-note">示意参数：max running = 2，token budget = 5。A/B/C 在 step 0 前已按顺序到达。</p>
+            <div class="sim-controls"><button class="sim-btn" id="nextStep">下一步 →</button><button class="sim-btn secondary" id="resetStep">重置</button></div>
+            <div class="queues"><div class="queue"><span class="queue-label">WAITING</span><div id="waitingQueue"></div></div><div class="queue"><span class="queue-label">RUNNING</span><div id="runningQueue"></div></div><div class="queue"><span class="queue-label">FINISHED</span><div id="finishedQueue"></div></div></div>
+          </div>
+          <div class="timeline" id="timeline"></div>
+        </div>
+        <div class="callout"><div class="icon">!</div><p><strong>当前 Engine 边界：</strong> <code>ContinuousBatchEngine</code> 已自动拆分 Prefill / Decode 子批、调用 Runner、统一同步 token、写回 Scheduler 并释放 blocks。当前仍是同步 Engine：Prefill 逐请求执行且位于 batched Decode 之前，不支持 chunked prefill、preemption 或 CPU/GPU overlap。</p></div>
+      </div>
+    </section>
+
+    <section id="code-map">
+      <div class="shell">
+        <div class="section-head">
+          <div><div class="kicker">06 · Source Map</div><h2>从概念回到代码</h2></div>
+          <p class="section-intro">以下不是“未来设计图”，而是当前仓库对象的职责与成熟度。文件链接可直接跳到源码。</p>
+        </div>
+        <div class="panel table-scroll">
+          <table class="matrix">
+            <thead><tr><th>组件</th><th>关键职责</th><th>主入口</th><th>状态</th></tr></thead>
+            <tbody>
+              <tr><td><strong>RequestScheduler</strong></td><td>队列、token budget、Decode 优先、结果写回</td><td><a class="file" href="../src/mini_llm_runtime/scheduler.py">scheduler.py</a></td><td><span class="badge done">完成</span></td></tr>
+              <tr><td><strong>Admission Controller</strong></td><td>接纳时保守预留请求全生命周期 blocks</td><td><a class="file" href="../src/mini_llm_runtime/block_admission.py">block_admission.py</a></td><td><span class="badge done">完成</span></td></tr>
+              <tr><td><strong>Paged KV Manager</strong></td><td>block pool、request table、GPU storage、metadata、释放</td><td><a class="file" href="../src/mini_llm_runtime/paged_kv_manager.py">paged_kv_manager.py</a></td><td><span class="badge done">完成</span></td></tr>
+              <tr><td><strong>Qwen Runner</strong></td><td>Prefill、单请求 Decode、多请求 batched Decode</td><td><a class="file" href="../src/mini_llm_runtime/qwen_model_runner.py">qwen_model_runner.py</a></td><td><span class="badge done">完成</span></td></tr>
+              <tr><td><strong>Batch Adapter</strong></td><td>保持 request row 顺序，统一 Decode transaction 与 metadata</td><td><a class="file" href="../src/mini_llm_runtime/paged_batch.py">paged_batch.py</a></td><td><span class="badge done">完成</span></td></tr>
+              <tr><td><strong>CUDA Attention</strong></td><td>block-table 间接寻址、GQA、online softmax</td><td><a class="file" href="../csrc/paged_attention_cuda.cu">paged_attention_cuda.cu</a></td><td><span class="badge done">v1</span></td></tr>
+              <tr><td><strong>Generation Loop</strong></td><td>Prefill + N−1 次 Decode 的单请求 greedy loop</td><td><a class="file" href="../src/mini_llm_runtime/generation.py">generation.py</a></td><td><span class="badge done">单请求</span></td></tr>
+              <tr><td><strong>ContinuousBatchEngine</strong></td><td>拆分 Prefill/Decode、token 写回、失败回滚与完成释放</td><td><a class="file" href="../src/mini_llm_runtime/engine.py">engine.py</a></td><td><span class="badge done">同步版完成</span></td></tr>
+              <tr><td><strong>高级调度</strong></td><td>chunked prefill、preemption、priority、cancellation</td><td><code>尚未实现</code></td><td><span class="badge future">未来</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="rules">
+      <div class="shell">
+        <div class="section-head">
+          <div><div class="kicker">07 · Mental Model</div><h2>必须守住的契约</h2></div>
+          <p class="section-intro">理解这六条，基本就抓住了整个项目最容易出错、也最有价值的部分。</p>
+        </div>
+        <div class="invariants">
+          <div class="invariant"><b>① Batch row 绝不能乱</b><p>token、position、Q/K/V、block table 和 length 的第 i 行必须属于同一 request。</p></div>
+          <div class="invariant"><b>② position ≠ read length</b><p>Decode position 是 old_len；当前 K/V 写入后 Attention 读取 old_len + 1。</p></div>
+          <div class="invariant"><b>③ 可见长度最后提交</b><p>24 层和 LM Head 都成功后才 commit；失败则所有请求一起回滚。</p></div>
+          <div class="invariant"><b>④ 最后输出不进 Cache</b><p>生成 N 个 token 最多只 Decode N−1 次，因此 capacity = prompt + N − 1。</p></div>
+          <div class="invariant"><b>⑤ Length 决定访问边界</b><p>block table 可能含 padding 或未来预留块，CUDA kernel 只能按 sequence length 访问。</p></div>
+          <div class="invariant"><b>⑥ Scheduler 不拥有显存</b><p>它只发完成事件；Engine/Admission Controller 才调用 manager 释放物理 blocks。</p></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer><div class="shell"><span>状态已按 clean-tree release evidence · <code>e01c3c7</code> 更新</span><span>建议从「生命周期」开始交互浏览</span></div></footer>
+
+  <script>
+    const steps = [
+      {title:'模型启动', tag:'qwen_loader.py', text:'直接读取 config.json 与 safetensors，不构造 Hugging Face 模型对象。权重会被严格映射到 QwenWeights，并检查名称、shape、dtype、device 与 tied LM Head。', input:'模型目录 + device + dtype', output:'QwenConfig + QwenWeights', file:'../src/mini_llm_runtime/qwen_loader.py'},
+      {title:'请求进入队列', tag:'RequestScheduler.submit()', text:'Tokenizer 位于 runtime 边界之外。Engine 将 prompt token IDs、最大生成数和 EOS 提交给 Scheduler，请求状态从 WAITING 开始，并按 arrival_index 进入 FIFO 队列。', input:'request_id + prompt_token_ids + max_new_tokens', output:'RequestState(status=WAITING)', file:'../src/mini_llm_runtime/scheduler.py'},
+      {title:'接纳与预留', tag:'PagedBlockAdmissionController.try_admit()', text:'Scheduler 有空闲 running slot 且 token budget 足够时，调用 admission callback。当前策略一次预留 prompt + max_new_tokens − 1 所需的全部 blocks，避免生成中途 OOM。', input:'waiting RequestState + free block count', output:'RequestBlockTable + reserved physical blocks', file:'../src/mini_llm_runtime/block_admission.py'},
+      {title:'Prefill', tag:'QwenPrefillRunner.prefill()', text:'完整 prompt 经过 Embedding 和所有 Decoder layers。每层生成的 RoPE 后 K 与原始 V 写进 Paged Cache；最后位置 logits 经 argmax 得到首个输出 token。', input:'input_ids [1,S] + empty request cache', output:'logits [1,S,V] + committed K/V length=S', file:'../src/mini_llm_runtime/qwen_model_runner.py'},
+      {title:'Batched Decode', tag:'QwenPrefillRunner.decode_batch()', text:'每个 running 请求贡献上一次生成的一个 token。Adapter 按 Scheduler 顺序构造不同 position 与 block table；每层一次 batched Paged Attention，同步推进多个变长请求。', input:'token_ids [B,1] + ordered request_ids', output:'logits [B,1,V] + each cache length+1', file:'../src/mini_llm_runtime/paged_batch.py'},
+      {title:'结果写回', tag:'apply_step_results()', text:'每个 batch item 恰好产出一个 token。Scheduler 原子校验 request ID 集合，追加输出，并依据 EOS 或 max_new_tokens 把请求标记为 FINISHED；未结束的请求留在 RUNNING。', input:'Map<request_id, generated_token>', output:'emitted_tokens + finished_request_ids', file:'../src/mini_llm_runtime/scheduler.py'},
+      {title:'释放与复用', tag:'release_finished()', text:'Scheduler 只报告完成事件，不直接碰 GPU tensor。Engine 消费 finished IDs，Admission Controller 让 Manager 释放该请求全部物理 block，block IDs 回到 free list，下一 step 可接纳新请求。', input:'finished_request_ids', output:'released block IDs + reusable capacity', file:'../src/mini_llm_runtime/block_admission.py'}
+    ];
+    const list = document.getElementById('stepList');
+    const detail = document.getElementById('stepDetail');
+    function renderStep(index) {
+      [...list.children].forEach((x,i)=>x.classList.toggle('active', i===index));
+      const s=steps[index]; detail.dataset.watermark=String(index+1).padStart(2,'0');
+      detail.innerHTML=`<h3>${s.title}</h3><span class="tag">${s.tag}</span><p>${s.text}</p><div class="io-grid"><div class="io"><b>Input</b><code>${s.input}</code></div><div class="io"><b>Output</b><code>${s.output}</code></div></div><a class="source-link" href="${s.file}">查看对应源码 →</a>`;
+    }
+    steps.forEach((s,i)=>{ const b=document.createElement('button'); b.className='step-button'; b.innerHTML=`<span class="step-num">${String(i+1).padStart(2,'0')}</span><span>${s.title}</span>`; b.onclick=()=>renderStep(i); list.appendChild(b); });
+    renderStep(0);
+
+    document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
+      document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active')); document.querySelectorAll('.path-wrap').forEach(x=>x.classList.remove('active'));
+      t.classList.add('active'); document.getElementById(t.dataset.tab).classList.add('active');
+    }));
+
+    const table=[2,0,5], blockSize=3, tokenCount=8;
+    const tokenStrip=document.getElementById('tokenStrip'), blockPool=document.getElementById('blockPool'), readout=document.getElementById('mappingReadout');
+    for(let p=0;p<6;p++){ const b=document.createElement('div'); b.className='block'; b.dataset.block=p; b.innerHTML=`<div class="block-id">block ${p}</div><div class="slots">${[0,1,2].map(o=>`<span class="slot" data-slot="${o}">·</span>`).join('')}</div>`; blockPool.appendChild(b); }
+    for(let t=0;t<tokenCount;t++){ const x=document.createElement('button'); x.className='token'; x.textContent=`t${t}`; x.onclick=()=>mapToken(t); tokenStrip.appendChild(x); const lb=Math.floor(t/blockSize), off=t%blockSize, pb=table[lb]; const slot=blockPool.querySelector(`[data-block="${pb}"] [data-slot="${off}"]`); slot.textContent=`t${t}`; slot.classList.add('used'); }
+    function mapToken(t){ document.querySelectorAll('.token,.block,.slot').forEach(x=>x.classList.remove('active','target')); tokenStrip.children[t].classList.add('active'); const lb=Math.floor(t/blockSize), off=t%blockSize, pb=table[lb]; const block=blockPool.querySelector(`[data-block="${pb}"]`); block.classList.add('active'); block.querySelector(`[data-slot="${off}"]`).classList.add('target'); readout.innerHTML=`logical_block = ${t} // ${blockSize} = <b>${lb}</b><br>physical_block = table[${lb}] = <b>${pb}</b><br>block_offset = ${t} % ${blockSize} = <b>${off}</b>`; }
+    mapToken(4);
+
+    const sim=[
+      {waiting:['C'],running:['A','B'],finished:[], work:[['A','PREFILL'],['B','PREFILL']],budget:'5/5'},
+      {waiting:['C'],running:['A','B'],finished:[], work:[['A','DECODE'],['B','DECODE']],budget:'2/5'},
+      {waiting:[],running:['B','C'],finished:['A'], work:[['A','DECODE'],['B','DECODE'],['C','PREFILL']],budget:'5/5'},
+      {waiting:[],running:['C'],finished:['A','B'], work:[['B','DECODE'],['C','DECODE']],budget:'2/5'},
+      {waiting:[],running:[],finished:['A','B','C'], work:[['C','DECODE']],budget:'1/5'}
+    ];
+    const timeline=document.getElementById('timeline');
+    sim.forEach((s,i)=>{ const tick=document.createElement('div'); tick.className='tick'; tick.innerHTML=`<div class="tick-label">STEP ${i}</div><div class="tick-work">${s.work.map(w=>`<span class="work ${w[1].toLowerCase()}">${w[0]} · ${w[1]}</span>`).join('')}<span class="budget">tokens ${s.budget}</span></div>`; timeline.appendChild(tick); });
+    let current=0;
+    function renderSim(){ const s=sim[current]; document.getElementById('stepIndex').textContent=current; for(const [id,key,klass] of [['waitingQueue','waiting',''],['runningQueue','running','run'],['finishedQueue','finished','finish']]) document.getElementById(id).innerHTML=s[key].map(x=>`<span class="request ${klass}">${x}</span>`).join(' '); [...timeline.children].forEach((x,i)=>{x.classList.toggle('current',i===current);x.classList.toggle('past',i<current)}); }
+    document.getElementById('nextStep').onclick=()=>{current=(current+1)%sim.length;renderSim()}; document.getElementById('resetStep').onclick=()=>{current=0;renderSim()}; renderSim();
+
+    const sections=[...document.querySelectorAll('main section')], links=[...document.querySelectorAll('.nav a')];
+    const observer=new IntersectionObserver(entries=>entries.forEach(e=>{if(e.isIntersecting){links.forEach(a=>a.classList.toggle('active',a.getAttribute('href')===`#${e.target.id}`))}}),{rootMargin:'-30% 0px -62%'}); sections.forEach(s=>observer.observe(s));
+  </script>
+</body>
+</html>
