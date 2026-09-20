@@ -58,6 +58,9 @@ stream、event 和双缓冲隐藏这段开销，本阶段不提前实现。
 请求现在统一通过 `engine.submit()` 记录 arrival，并保存 first-token、逐 token 和 completion
 事件；指标定义与同步边界见 [请求级时间线](request_metrics.md)。
 
+同一个 Engine 也可以使用 no-refill Static policy 作为公平基线；两种 admission 轨迹及其
+实验边界见 [Static 与 Continuous Batching 策略](batching_policy.md)。
+
 ## 当前边界
 
 - 只支持 greedy decoding，不支持 temperature、top-k/top-p。

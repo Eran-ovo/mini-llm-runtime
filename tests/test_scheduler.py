@@ -3,6 +3,7 @@ import torch
 
 from mini_llm_runtime.paged_kv_manager import PagedKVCacheManager
 from mini_llm_runtime.scheduler import (
+    BatchingPolicy,
     FinishReason,
     RequestScheduler,
     RequestStatus,
@@ -91,6 +92,52 @@ def test_strict_fifo_does_not_skip_large_head_prompt() -> None:
     fourth = scheduler.schedule_step()
     assert fourth is not None
     assert fourth.prefill_request_ids == ("small",)
+
+
+def test_static_policy_waits_for_running_cohort_to_drain() -> None:
+    scheduler = RequestScheduler(
+        max_running_requests=3,
+        max_batch_tokens=6,
+        batching_policy=BatchingPolicy.STATIC,
+    )
+    scheduler.submit("A", (1, 2, 3), max_new_tokens=3)
+    scheduler.submit("B", (4, 5), max_new_tokens=1)
+
+    first = scheduler.schedule_step()
+    assert first is not None
+    # cohort 初建时仍应一次接纳 A/B，而不是只接纳第一个请求。
+    assert first.prefill_request_ids == ("A", "B")
+    scheduler.apply_step_results({"A": 10, "B": 20})
+    assert scheduler.finished_request_ids == ("B",)
+
+    scheduler.submit("C", (6,), max_new_tokens=1)
+    second = scheduler.schedule_step()
+    assert second is not None
+    assert second.decode_request_ids == ("A",)
+    assert second.prefill_request_ids == ()
+    assert scheduler.waiting_request_ids == ("C",)
+    scheduler.apply_step_results({"A": 11})
+
+    # 即使 A 将在本 step 完成，也不能提前假设结果并把 C 混入 cohort。
+    third = scheduler.schedule_step()
+    assert third is not None
+    assert third.decode_request_ids == ("A",)
+    assert third.prefill_request_ids == ()
+    scheduler.apply_step_results({"A": 12})
+
+    fourth = scheduler.schedule_step()
+    assert fourth is not None
+    assert fourth.decode_request_ids == ()
+    assert fourth.prefill_request_ids == ("C",)
+
+
+def test_scheduler_rejects_invalid_batching_policy() -> None:
+    with pytest.raises(ValueError, match="BatchingPolicy"):
+        RequestScheduler(
+            max_running_requests=1,
+            max_batch_tokens=1,
+            batching_policy="static",  # type: ignore[arg-type]
+        )
 
 
 def test_outstanding_batch_requires_exact_atomic_result_set() -> None:

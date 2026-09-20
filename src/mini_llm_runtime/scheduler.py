@@ -1,4 +1,4 @@
-"""Continuous Batching 的同步 CPU 请求状态机与确定性调度策略。"""
+"""Static/Continuous Batching 共用的同步 CPU 请求状态机。"""
 
 from __future__ import annotations
 
@@ -22,6 +22,13 @@ class FinishReason(str, Enum):
 class WorkKind(str, Enum):
     PREFILL = "prefill"
     DECODE = "decode"
+
+
+class BatchingPolicy(str, Enum):
+    """是否允许在已有 running cohort 中补入新请求。"""
+
+    CONTINUOUS = "continuous"
+    STATIC = "static"
 
 
 @dataclass
@@ -90,7 +97,8 @@ class RequestScheduler:
     """Decode-priority、whole-prefill、strict-FIFO 的同步调度器。
 
     `schedule_step()` 与 `apply_step_results()` 必须交替调用。同一时刻只允许一个
-    outstanding batch，模拟 GPU batch 尚未完成时请求不能被重复调度。
+    outstanding batch，模拟 GPU batch 尚未完成时请求不能被重复调度。Static 与
+    Continuous 只改变是否给未结束的 running cohort 补入新请求。
     """
 
     def __init__(
@@ -99,6 +107,7 @@ class RequestScheduler:
         max_running_requests: int,
         max_batch_tokens: int,
         admission_callback: Callable[[RequestState], bool] | None = None,
+        batching_policy: BatchingPolicy = BatchingPolicy.CONTINUOUS,
     ) -> None:
         if max_running_requests <= 0 or max_batch_tokens <= 0:
             raise ValueError("max_running_requests 和 max_batch_tokens 必须 > 0")
@@ -107,8 +116,11 @@ class RequestScheduler:
                 "max_running_requests 不能大于 max_batch_tokens，"
                 "否则无法保证每个 running 请求每步 Decode 一次"
             )
+        if not isinstance(batching_policy, BatchingPolicy):
+            raise ValueError("batching_policy 必须是 BatchingPolicy")
         self.max_running_requests = max_running_requests
         self.max_batch_tokens = max_batch_tokens
+        self.batching_policy = batching_policy
         self._admission_callback = admission_callback
         self._requests: dict[str, RequestState] = {}
         self._waiting: deque[str] = deque()
@@ -205,7 +217,13 @@ class RequestScheduler:
 
         token_count = len(items)
         available_slots = self.max_running_requests - len(self._running)
-        while self._waiting and available_slots > 0:
+        # 必须在 admission 前固定本 step 的决定。Static cohort 初建时可一次接纳
+        # 多个请求；已有 running 请求时则完全禁止 refill。
+        may_admit_prefill = (
+            self.batching_policy is BatchingPolicy.CONTINUOUS
+            or not self._running
+        )
+        while may_admit_prefill and self._waiting and available_slots > 0:
             request_id = self._waiting[0]
             request = self._requests[request_id]
             prompt_cost = len(request.prompt_token_ids)

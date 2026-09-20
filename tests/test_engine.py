@@ -7,13 +7,15 @@ from mini_llm_runtime.engine import ContinuousBatchEngine
 from mini_llm_runtime.paged_attention import paged_decode_attention_reference
 from mini_llm_runtime.paged_kv_manager import PagedKVCacheManager
 from mini_llm_runtime.qwen_model_runner import QwenPrefillRunner
-from mini_llm_runtime.scheduler import RequestScheduler, WorkKind
+from mini_llm_runtime.scheduler import BatchingPolicy, RequestScheduler, WorkKind
 
 from test_qwen_prefill_cache import make_runner
 
 
 def make_engine(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    batching_policy: BatchingPolicy = BatchingPolicy.CONTINUOUS,
 ) -> tuple[ContinuousBatchEngine, RequestScheduler, PagedBlockAdmissionController]:
     base, weights = make_runner()
     runner = QwenPrefillRunner(
@@ -33,6 +35,7 @@ def make_engine(
         max_running_requests=3,
         max_batch_tokens=5,
         admission_callback=admission.try_admit,
+        batching_policy=batching_policy,
     )
 
     def reference_attention(
@@ -176,6 +179,40 @@ def test_mixed_step_decode_failure_restores_scheduler_and_new_prefill(
     # 失败尝试本身也是时间线事实；没有产生虚假的 token event。
     assert len(engine.metrics.snapshot("B").prefill_attempt_started_ns) == 2
     assert len(engine.metrics.snapshot("B").token_events) == 1
+
+
+def test_static_engine_does_not_refill_until_cohort_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, scheduler, admission = make_engine(
+        monkeypatch, batching_policy=BatchingPolicy.STATIC
+    )
+    engine.submit("A", (1, 2, 3), max_new_tokens=3)
+    engine.submit("B", (4, 0), max_new_tokens=1)
+    first = engine.step()
+    assert first is not None
+    assert first.batch.prefill_request_ids == ("A", "B")
+    assert first.update.finished_request_ids == ("B",)
+
+    engine.submit("C", (1,), max_new_tokens=1)
+    second = engine.step()
+    assert second is not None
+    assert second.batch.decode_request_ids == ("A",)
+    assert second.batch.prefill_request_ids == ()
+    assert scheduler.waiting_request_ids == ("C",)
+
+    third = engine.step()
+    assert third is not None
+    assert third.batch.decode_request_ids == ("A",)
+    assert third.update.finished_request_ids == ("A",)
+    assert scheduler.waiting_request_ids == ("C",)
+
+    fourth = engine.step()
+    assert fourth is not None
+    assert fourth.batch.prefill_request_ids == ("C",)
+    assert fourth.update.finished_request_ids == ("C",)
+    assert admission.manager.request_ids == ()
+    assert not scheduler.has_unfinished_requests
 
 
 def test_scheduler_abort_preserves_fifo_before_new_arrivals() -> None:
