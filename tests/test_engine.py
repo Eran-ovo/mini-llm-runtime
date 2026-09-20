@@ -3,13 +3,44 @@ import torch
 
 import mini_llm_runtime.qwen_model_runner as model_runner_module
 from mini_llm_runtime.block_admission import PagedBlockAdmissionController
-from mini_llm_runtime.engine import ContinuousBatchEngine
+from mini_llm_runtime.engine import ContinuousBatchEngine, _nvtx_range
 from mini_llm_runtime.paged_attention import paged_decode_attention_reference
 from mini_llm_runtime.paged_kv_manager import PagedKVCacheManager
 from mini_llm_runtime.qwen_model_runner import QwenPrefillRunner
 from mini_llm_runtime.scheduler import BatchingPolicy, RequestScheduler, WorkKind
 
 from test_qwen_prefill_cache import make_runner
+
+
+def test_nvtx_range_balances_push_pop_on_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        torch.cuda.nvtx,
+        "range_push",
+        lambda message: events.append(("push", message)),
+    )
+    monkeypatch.setattr(
+        torch.cuda.nvtx,
+        "range_pop",
+        lambda: events.append(("pop", None)),
+    )
+
+    with _nvtx_range(True, "success"):
+        pass
+    with pytest.raises(RuntimeError, match="injected"):
+        with _nvtx_range(True, "failure"):
+            raise RuntimeError("injected")
+    with _nvtx_range(False, "disabled"):
+        pass
+
+    assert events == [
+        ("push", "success"),
+        ("pop", None),
+        ("push", "failure"),
+        ("pop", None),
+    ]
 
 
 def make_engine(

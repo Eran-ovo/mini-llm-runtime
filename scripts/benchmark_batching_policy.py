@@ -88,6 +88,7 @@ def build_engine(
     block_size: int,
     max_running_requests: int,
     max_batch_tokens: int,
+    enable_nvtx: bool = False,
 ) -> ContinuousBatchEngine:
     # 容量覆盖全部请求完整生命周期，排除 block OOM 对 admission policy 的干扰。
     total_blocks = sum(
@@ -114,6 +115,7 @@ def build_engine(
         scheduler=scheduler,
         runner=runner,
         admission=admission,
+        enable_nvtx=enable_nvtx,
     )
 
 
