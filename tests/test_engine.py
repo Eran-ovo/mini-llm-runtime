@@ -47,6 +47,7 @@ def make_engine(
     monkeypatch: pytest.MonkeyPatch,
     *,
     batching_policy: BatchingPolicy = BatchingPolicy.CONTINUOUS,
+    max_mixed_prefill_tokens: int | None = None,
 ) -> tuple[ContinuousBatchEngine, RequestScheduler, PagedBlockAdmissionController]:
     base, weights = make_runner()
     runner = QwenPrefillRunner(
@@ -65,6 +66,7 @@ def make_engine(
     scheduler = RequestScheduler(
         max_running_requests=3,
         max_batch_tokens=5,
+        max_mixed_prefill_tokens=max_mixed_prefill_tokens,
         admission_callback=admission.try_admit,
         batching_policy=batching_policy,
     )
@@ -147,6 +149,33 @@ def test_engine_runs_prefill_mixed_decode_and_releases_finished(
     assert metrics_b.median_tpot_ns is None
     assert all(item.completed_ns is not None for item in (metrics_a, metrics_b, metrics_c))
     assert engine.step() is None
+
+
+def test_engine_applies_mixed_prefill_budget_at_runtime_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, scheduler, _ = make_engine(
+        monkeypatch, max_mixed_prefill_tokens=1
+    )
+    engine.submit("A", (1, 2, 3), max_new_tokens=3)
+    engine.submit("B", (4, 0), max_new_tokens=1)
+    first = engine.step()
+    assert first is not None
+    # 初始 5-token cohort 不受 1-token mixed budget 限制。
+    assert first.batch.prefill_request_ids == ("A", "B")
+
+    engine.submit("C", (1,), max_new_tokens=1)
+    engine.submit("D", (2,), max_new_tokens=1)
+    second = engine.step()
+    assert second is not None
+    assert second.batch.decode_request_ids == ("A",)
+    assert second.batch.prefill_request_ids == ("C",)
+    assert scheduler.waiting_request_ids == ("D",)
+
+    third = engine.step()
+    assert third is not None
+    assert third.batch.decode_request_ids == ("A",)
+    assert third.batch.prefill_request_ids == ("D",)
 
 
 def test_mixed_step_decode_failure_restores_scheduler_and_new_prefill(

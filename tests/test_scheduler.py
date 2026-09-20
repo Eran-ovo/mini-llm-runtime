@@ -131,6 +131,67 @@ def test_static_policy_waits_for_running_cohort_to_drain() -> None:
     assert fourth.prefill_request_ids == ("C",)
 
 
+def test_mixed_prefill_budget_spreads_refill_without_limiting_initial_cohort() -> None:
+    scheduler = RequestScheduler(
+        max_running_requests=4,
+        max_batch_tokens=20,
+        max_mixed_prefill_tokens=3,
+    )
+    scheduler.submit("A", (1, 2, 3, 4), max_new_tokens=4)
+    scheduler.submit("B", (5, 6, 7, 8), max_new_tokens=1)
+
+    first = scheduler.schedule_step()
+    assert first is not None
+    # 初始 cohort 不受 mixed budget=3 限制，两个 4-token prompt 都能进入。
+    assert first.prefill_request_ids == ("A", "B")
+    assert first.token_count == 8
+    scheduler.apply_step_results({"A": 10, "B": 20})
+
+    scheduler.submit("C", (9, 10, 11), max_new_tokens=1)
+    scheduler.submit("D", (12, 13), max_new_tokens=1)
+    second = scheduler.schedule_step()
+    assert second is not None
+    # A 的 Decode 不计入 mixed-prefill budget；C 恰好消耗 3，D 留到下一步。
+    assert second.decode_request_ids == ("A",)
+    assert second.prefill_request_ids == ("C",)
+    assert second.token_count == 4
+    scheduler.apply_step_results({"A": 11, "C": 30})
+
+    third = scheduler.schedule_step()
+    assert third is not None
+    # budget 每个 step 重新计算，因此 D 可在下一 mixed step 加入。
+    assert third.decode_request_ids == ("A",)
+    assert third.prefill_request_ids == ("D",)
+
+
+def test_over_mixed_budget_head_waits_then_enters_after_cohort_drains() -> None:
+    scheduler = RequestScheduler(
+        max_running_requests=3,
+        max_batch_tokens=10,
+        max_mixed_prefill_tokens=3,
+    )
+    scheduler.submit("running", (1,), max_new_tokens=2)
+    first = scheduler.schedule_step()
+    assert first is not None
+    scheduler.apply_step_results({"running": 10})
+
+    scheduler.submit("large", (2, 3, 4, 5), max_new_tokens=1)
+    scheduler.submit("small", (6,), max_new_tokens=1)
+    second = scheduler.schedule_step()
+    assert second is not None
+    # 队首 large 超过 mixed budget；strict FIFO 禁止跳过它接纳 small。
+    assert second.decode_request_ids == ("running",)
+    assert second.prefill_request_ids == ()
+    assert scheduler.waiting_request_ids == ("large", "small")
+    scheduler.apply_step_results({"running": 11})
+
+    third = scheduler.schedule_step()
+    assert third is not None
+    # 旧 cohort 已排空，这不再是 mixed step；large 不会永久饥饿。
+    assert third.prefill_request_ids == ("large", "small")
+    assert third.token_count == 5
+
+
 def test_scheduler_rejects_invalid_batching_policy() -> None:
     with pytest.raises(ValueError, match="BatchingPolicy"):
         RequestScheduler(
@@ -168,6 +229,13 @@ def test_scheduler_validates_configuration_and_submissions() -> None:
         RequestScheduler(max_running_requests=0, max_batch_tokens=4)
     with pytest.raises(ValueError, match="不能大于"):
         RequestScheduler(max_running_requests=5, max_batch_tokens=4)
+    for invalid_budget in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="正整数或 None"):
+            RequestScheduler(
+                max_running_requests=1,
+                max_batch_tokens=4,
+                max_mixed_prefill_tokens=invalid_budget,  # type: ignore[arg-type]
+            )
 
     scheduler = RequestScheduler(max_running_requests=2, max_batch_tokens=4)
     with pytest.raises(ValueError, match="不能为空"):

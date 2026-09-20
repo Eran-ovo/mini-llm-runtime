@@ -88,6 +88,7 @@ def build_engine(
     block_size: int,
     max_running_requests: int,
     max_batch_tokens: int,
+    max_mixed_prefill_tokens: int | None = None,
     enable_nvtx: bool = False,
 ) -> ContinuousBatchEngine:
     # 容量覆盖全部请求完整生命周期，排除 block OOM 对 admission policy 的干扰。
@@ -108,6 +109,7 @@ def build_engine(
     scheduler = RequestScheduler(
         max_running_requests=max_running_requests,
         max_batch_tokens=max_batch_tokens,
+        max_mixed_prefill_tokens=max_mixed_prefill_tokens,
         admission_callback=admission.try_admit,
         batching_policy=policy,
     )
@@ -127,6 +129,7 @@ def run_trial(
     block_size: int,
     max_running_requests: int,
     max_batch_tokens: int,
+    max_mixed_prefill_tokens: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, tuple[int, ...]]]:
     engine = build_engine(
         policy=policy,
@@ -135,6 +138,7 @@ def run_trial(
         block_size=block_size,
         max_running_requests=max_running_requests,
         max_batch_tokens=max_batch_tokens,
+        max_mixed_prefill_tokens=max_mixed_prefill_tokens,
     )
     device = runner.weights.embedding.device
     torch.cuda.synchronize(device)
@@ -227,6 +231,7 @@ def run_trial(
     peak_reserved = int(torch.cuda.max_memory_reserved(device))
     trial = {
         "policy": policy.value,
+        "max_mixed_prefill_tokens": max_mixed_prefill_tokens,
         "host_trial_ns": host_completed_ns - host_started_ns,
         "service_window_ns": service_window_ns,
         "cuda_timeline_samples_ms": cuda_samples_ms,

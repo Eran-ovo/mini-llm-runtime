@@ -106,6 +106,7 @@ class RequestScheduler:
         *,
         max_running_requests: int,
         max_batch_tokens: int,
+        max_mixed_prefill_tokens: int | None = None,
         admission_callback: Callable[[RequestState], bool] | None = None,
         batching_policy: BatchingPolicy = BatchingPolicy.CONTINUOUS,
     ) -> None:
@@ -118,8 +119,15 @@ class RequestScheduler:
             )
         if not isinstance(batching_policy, BatchingPolicy):
             raise ValueError("batching_policy 必须是 BatchingPolicy")
+        if max_mixed_prefill_tokens is not None and (
+            isinstance(max_mixed_prefill_tokens, bool)
+            or not isinstance(max_mixed_prefill_tokens, int)
+            or max_mixed_prefill_tokens <= 0
+        ):
+            raise ValueError("max_mixed_prefill_tokens 必须是正整数或 None")
         self.max_running_requests = max_running_requests
         self.max_batch_tokens = max_batch_tokens
+        self.max_mixed_prefill_tokens = max_mixed_prefill_tokens
         self.batching_policy = batching_policy
         self._admission_callback = admission_callback
         self._requests: dict[str, RequestState] = {}
@@ -202,6 +210,9 @@ class RequestScheduler:
             return None
 
         items: list[ScheduledRequest] = []
+        # 必须在接纳新请求前记录：这个 step 是否以已有 Decode 请求开始。
+        # 后面 self._running 会因 Prefill admission 增长，不能再用它判断 mixed step。
+        running_at_step_start = bool(self._running)
         # Decode 优先：已有 running 请求每步都获得一个 token，降低 TPOT 抖动。
         for request_id in self._running:
             request = self._requests[request_id]
@@ -221,14 +232,26 @@ class RequestScheduler:
         # 多个请求；已有 running 请求时则完全禁止 refill。
         may_admit_prefill = (
             self.batching_policy is BatchingPolicy.CONTINUOUS
-            or not self._running
+            or not running_at_step_start
         )
+        # 这个计数只统计本 mixed step 新接纳的 prompt token，不包含 Decode token，
+        # 也不影响没有历史 running 请求的初始 cohort。
+        mixed_prefill_tokens = 0
         while may_admit_prefill and self._waiting and available_slots > 0:
             request_id = self._waiting[0]
             request = self._requests[request_id]
             prompt_cost = len(request.prompt_token_ids)
             # strict FIFO：队首放不下时停止，不能越过它选择更短的后续请求。
             if token_count + prompt_cost > self.max_batch_tokens:
+                break
+            if (
+                running_at_step_start
+                and self.max_mixed_prefill_tokens is not None
+                and mixed_prefill_tokens + prompt_cost
+                > self.max_mixed_prefill_tokens
+            ):
+                # whole-prefill + strict FIFO：不切 prompt，也不越过队首挑短请求。
+                # 当旧 cohort 排空后，该限制不再生效，因此大 prompt 不会永久饥饿。
                 break
             # callback 必须保证：返回 False 时无副作用；返回 True 时资源已经
             # 原子预留。资源不足同样遵守 strict FIFO，不跳过队首请求。
@@ -248,6 +271,8 @@ class RequestScheduler:
                 )
             )
             token_count += prompt_cost
+            if running_at_step_start:
+                mixed_prefill_tokens += prompt_cost
             available_slots -= 1
 
         if not items:
