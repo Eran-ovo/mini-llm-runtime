@@ -202,3 +202,122 @@ class PagedBatchDecodeAdapter:
             raise IndexError(
                 f"layer_index={layer_index} 越界，有效范围 [0,{self.num_layers})"
             )
+
+
+class PagedBatchPrefillAdapter:
+    """把多个空请求的 packed Prefill 写入各自的物理 KV block。
+
+    `lengths[i]` 对应 `request_ids[i]`；所有层成功后才一起提交长度。
+    这个版本复用正确性优先的逐 token storage 写入，后续可替换成 CUDA kernel。
+    """
+
+    def __init__(
+        self,
+        manager: PagedKVCacheManager,
+        request_ids: tuple[str, ...],
+        lengths: tuple[int, ...],
+    ) -> None:
+        if not request_ids or len(request_ids) != len(lengths):
+            raise ValueError("Prefill request_ids 与 lengths 必须非空且等长")
+        if len(set(request_ids)) != len(request_ids):
+            raise ValueError("Prefill batch 不能包含重复 request_id")
+        if any(length <= 0 for length in lengths):
+            raise ValueError("Prefill lengths 必须全部 > 0")
+        self.manager = manager
+        self.request_ids = tuple(request_ids)
+        self.lengths = tuple(lengths)
+        self._tables = tuple(manager.get_request(rid) for rid in request_ids)
+        self._active = False
+        self._written_layers = [False] * self.num_layers
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.request_ids)
+
+    @property
+    def num_layers(self) -> int:
+        return self.manager.storage.num_layers
+
+    @property
+    def num_kv_heads(self) -> int:
+        return self.manager.storage.num_kv_heads
+
+    @property
+    def head_dim(self) -> int:
+        return self.manager.storage.head_dim
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.manager.storage.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.manager.storage.device
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def offsets(self) -> tuple[int, ...]:
+        """packed token 的边界，例如 lengths=(3,2) 对应 (0,3,5)。"""
+        result = [0]
+        for length in self.lengths:
+            result.append(result[-1] + length)
+        return tuple(result)
+
+    def begin_prefill(self) -> None:
+        if self._active:
+            raise RuntimeError("Prefill batch 已经有 active transaction")
+        for table in self._tables:
+            if table.pending is not None or table.token_count != 0:
+                raise ValueError(f"请求 {table.request_id!r} 的 Cache 必须为空")
+        begun: list[RequestBlockTable] = []
+        try:
+            for table, length in zip(self._tables, self.lengths, strict=True):
+                table.begin_append(length)
+                begun.append(table)
+        except Exception:
+            for table in reversed(begun):
+                table.abort_append()
+            raise
+        self._active = True
+        self._written_layers = [False] * self.num_layers
+
+    def write_layer(
+        self, layer_index: int, key: torch.Tensor, value: torch.Tensor
+    ) -> None:
+        if not self._active:
+            raise RuntimeError("当前没有 active Prefill batch transaction")
+        if not 0 <= layer_index < self.num_layers:
+            raise IndexError(f"layer_index={layer_index} 越界")
+        if self._written_layers[layer_index]:
+            raise RuntimeError(f"layer {layer_index} 已写入")
+        expected = (1, self.num_kv_heads, self.offsets[-1], self.head_dim)
+        if tuple(key.shape) != expected or tuple(value.shape) != expected:
+            raise ValueError(f"packed K/V 必须是 {expected}")
+        for table, start, end in zip(
+            self._tables, self.offsets[:-1], self.offsets[1:], strict=True
+        ):
+            self.manager.storage.write_layer(
+                table, layer_index, key[0, :, start:end], value[0, :, start:end]
+            )
+        self._written_layers[layer_index] = True
+
+    def commit_prefill(self) -> None:
+        if not self._active:
+            raise RuntimeError("当前没有 active Prefill batch transaction")
+        missing = [i for i, written in enumerate(self._written_layers) if not written]
+        if missing:
+            raise RuntimeError(f"不能 commit，尚未写入的层：{missing}")
+        for table in self._tables:
+            table.commit_append()
+        self._active = False
+
+    def abort_prefill(self) -> None:
+        if not self._active:
+            raise RuntimeError("当前没有 active Prefill batch transaction")
+        for table in reversed(self._tables):
+            table.abort_append()
+        self._active = False
+        self._written_layers = [False] * self.num_layers

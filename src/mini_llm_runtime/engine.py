@@ -10,8 +10,7 @@ from dataclasses import dataclass
 import torch
 
 from .block_admission import PagedBlockAdmissionController
-from .paged_batch import PagedBatchDecodeAdapter
-from .paged_kv_adapter import PagedRequestKVCache
+from .paged_batch import PagedBatchDecodeAdapter, PagedBatchPrefillAdapter
 from .qwen_model_runner import QwenPrefillRunner
 from .request_metrics import RequestMetricsCollector
 from .scheduler import (
@@ -49,7 +48,7 @@ class EngineStepResult:
 class ContinuousBatchEngine:
     """同步、greedy 的最小 Continuous Batching Engine。
 
-    当前 Prefill 逐请求执行，已有请求的 Decode 合并为一个 Paged batch。Scheduler
+    同轮 Prefill 使用 packed batch，已有请求的 Decode 使用 Paged batch。Scheduler
     必须使用本 Engine 所持 Admission Controller 的 `try_admit` 作为 callback。
     """
 
@@ -149,29 +148,39 @@ class ContinuousBatchEngine:
             self.metrics.require_registered(
                 tuple(item.request_id for item in batch.items)
             )
-            for item in batch.items:
-                if item.request_id not in prefill_ids:
-                    continue
-                message = (
-                    f"model.prefill:{item.request_id}:"
-                    f"tokens={len(item.input_token_ids)}"
-                )
-                with _nvtx_range(self.enable_nvtx, message):
-                    self.metrics.record_prefill_started(
-                        item.request_id, self._clock_ns()
-                    )
+            prefill_items = tuple(
+                item for item in batch.items if item.request_id in prefill_ids
+            )
+            if prefill_items:
+                with _nvtx_range(
+                    self.enable_nvtx,
+                    f"model.prefill_batch:requests={len(prefill_items)}:"
+                    f"tokens={sum(len(item.input_token_ids) for item in prefill_items)}",
+                ):
+                    for item in prefill_items:
+                        self.metrics.record_prefill_started(
+                            item.request_id, self._clock_ns()
+                        )
+                    # Scheduler 顺序同时决定 packed token 区间和结果行归属。
                     input_ids = torch.tensor(
-                        (item.input_token_ids,),
+                        (tuple(
+                            token
+                            for item in prefill_items
+                            for token in item.input_token_ids
+                        ),),
                         dtype=torch.long,
                         device=self.runner.weights.embedding.device,
                     )
-                    output = self.runner.prefill(
-                        input_ids,
-                        cache=PagedRequestKVCache(self.manager, item.request_id),
+                    prefill_ids = tuple(item.request_id for item in prefill_items)
+                    adapter = PagedBatchPrefillAdapter(
+                        self.manager,
+                        prefill_ids,
+                        tuple(len(item.input_token_ids) for item in prefill_items),
                     )
-                    selected_tokens[item.request_id] = output.logits[
-                        :, -1
-                    ].argmax(dim=-1)
+                    output = self.runner.prefill_batch(input_ids, cache=adapter)
+                    prefill_tokens = output.logits[:, -1].argmax(dim=-1)
+                    for index, request_id in enumerate(prefill_ids):
+                        selected_tokens[request_id] = prefill_tokens[index : index + 1]
 
             decode_items = tuple(
                 item

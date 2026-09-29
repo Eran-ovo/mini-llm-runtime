@@ -100,6 +100,29 @@ def make_engine(
     )
 
 
+def test_engine_packs_same_step_prefill_into_one_runner_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _, _ = make_engine(monkeypatch)
+    calls: list[tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]] = []
+    original = engine.runner.prefill_batch
+
+    def observed(input_ids: torch.Tensor, *, cache):
+        calls.append(
+            (cache.request_ids, cache.lengths, tuple(input_ids[0].tolist()))
+        )
+        return original(input_ids, cache=cache)
+
+    monkeypatch.setattr(engine.runner, "prefill_batch", observed)
+    engine.submit("A", (1, 2, 3), max_new_tokens=2)
+    engine.submit("B", (4, 0), max_new_tokens=1)
+    result = engine.step()
+
+    assert result is not None
+    assert calls == [(('A', 'B'), (3, 2), (1, 2, 3, 4, 0))]
+    assert result.batch.prefill_request_ids == ("A", "B")
+
+
 def test_engine_runs_prefill_mixed_decode_and_releases_finished(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

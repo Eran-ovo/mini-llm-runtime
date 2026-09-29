@@ -13,7 +13,7 @@ from .paged_attention_cuda import (
     _paged_decode_attention_cuda_unchecked,
     paged_decode_attention_cuda,
 )
-from .paged_batch import PagedBatchDecodeAdapter
+from .paged_batch import PagedBatchDecodeAdapter, PagedBatchPrefillAdapter
 from .paged_kv_adapter import PagedRequestKVCache
 from .qwen_config import QwenConfig
 from .qwen_weights import AttentionWeights, DecoderLayerWeights, QwenWeights
@@ -79,9 +79,10 @@ def _attention(
     config: QwenConfig,
     *,
     apply_causal_mask: bool,
-    cache: LayerKVCache | PagedBatchDecodeAdapter | None = None,
+    cache: LayerKVCache | PagedBatchDecodeAdapter | PagedBatchPrefillAdapter | None = None,
     layer_index: int | None = None,
     use_paged_decode_attention: bool = False,
+    packed_causal_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     query = _heads(
         F.linear(x, weights.q_proj.weight, weights.q_proj.bias),
@@ -131,13 +132,18 @@ def _attention(
             inputs.sequence_lengths,
         ).unsqueeze(2)
     else:
-        if cache is not None:
+        if cache is not None and not isinstance(cache, PagedBatchPrefillAdapter):
             key, value = cache.view_layer(layer_index, include_pending=True)
         key = _repeat_kv(key, config.gqa_group_size)
         value = _repeat_kv(value, config.gqa_group_size)
 
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(config.head_dim)
-        if apply_causal_mask:
+        if packed_causal_mask is not None:
+            # 同一请求只能看见本请求过去和当前 token；不同请求的分数必须遮住。
+            scores = scores.masked_fill(
+                ~packed_causal_mask[None, None], torch.finfo(x.dtype).min
+            )
+        elif apply_causal_mask:
             key_length = key.shape[2]
             if query_length != key_length:
                 raise ValueError("当前 causal mask 只支持 Prefill 的方形 attention")
@@ -167,9 +173,10 @@ def _decoder_layer(
     config: QwenConfig,
     *,
     apply_causal_mask: bool,
-    cache: LayerKVCache | PagedBatchDecodeAdapter | None = None,
+    cache: LayerKVCache | PagedBatchDecodeAdapter | PagedBatchPrefillAdapter | None = None,
     layer_index: int | None = None,
     use_paged_decode_attention: bool = False,
+    packed_causal_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     residual = x
     x = _rms_norm(x, weights.input_norm, config.rms_norm_eps)
@@ -182,6 +189,7 @@ def _decoder_layer(
         cache=cache,
         layer_index=layer_index,
         use_paged_decode_attention=use_paged_decode_attention,
+        packed_causal_mask=packed_causal_mask,
     )
     residual = x
     x = _rms_norm(x, weights.post_attention_norm, config.rms_norm_eps)
@@ -265,6 +273,76 @@ class QwenPrefillRunner:
             logits=logits,
             layer_outputs=tuple(captured) if captured is not None else None,
         )
+
+    @torch.inference_mode()
+    def prefill_batch(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        cache: PagedBatchPrefillAdapter,
+    ) -> QwenPrefillOutput:
+        """一次模型前向处理多个无 padding prompt，返回每条请求末位 logits。
+
+        `input_ids` 为 `[1,total_tokens]`，依照 `cache.request_ids` 顺序拼接。
+        这里用块对角 causal mask 定义正确语义；大 prompt 的高效 varlen
+        attention 是后续单独优化的目标。
+        """
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError("Packed Prefill input_ids 必须是 [1,total_tokens]")
+        if input_ids.device != self.weights.embedding.device:
+            raise ValueError("input_ids 与权重必须位于同一 device")
+        self._validate_paged_batch_layout(cache, cache.batch_size)
+        offsets = cache.offsets
+        if input_ids.shape[1] != offsets[-1]:
+            raise ValueError("packed token 数与各请求 lengths 之和不一致")
+        if max(cache.lengths) > self.config.max_position_embeddings:
+            raise ValueError("至少一个 prompt 超过 max_position_embeddings")
+        if cache.active:
+            raise ValueError("Prefill 开始前不能存在 active transaction")
+
+        # position 每遇到新请求都归零。segment_id 用于阻止跨请求 Attention。
+        positions_cpu = [position for length in cache.lengths for position in range(length)]
+        segment_cpu = [index for index, length in enumerate(cache.lengths) for _ in range(length)]
+        positions = torch.tensor(
+            (positions_cpu,), dtype=torch.long, device=input_ids.device
+        )
+        segment_ids = torch.tensor(segment_cpu, device=input_ids.device)
+        indices = torch.arange(offsets[-1], device=input_ids.device)
+        causal_mask = (segment_ids[:, None] == segment_ids[None, :]) & (
+            indices[:, None] >= indices[None, :]
+        )
+
+        x = F.embedding(input_ids, self.weights.embedding)
+        cache.begin_prefill()
+        try:
+            for layer_index, layer in enumerate(self.weights.layers):
+                x = _decoder_layer(
+                    x,
+                    positions,
+                    layer,
+                    self.config,
+                    apply_causal_mask=False,
+                    cache=cache,
+                    layer_index=layer_index,
+                    packed_causal_mask=causal_mask,
+                )
+            # 只对每个 prompt 的末位执行 LM Head，避免分配 [T,vocab] logits。
+            last_indices = torch.tensor(
+                [end - 1 for end in offsets[1:]],
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+            last_hidden = x[:, last_indices]
+            last_hidden = _rms_norm(
+                last_hidden, self.weights.final_norm, self.config.rms_norm_eps
+            )
+            logits = F.linear(last_hidden, self.weights.embedding).transpose(0, 1)
+            cache.commit_prefill()
+        except Exception:
+            if cache.active:
+                cache.abort_prefill()
+            raise
+        return QwenPrefillOutput(logits=logits)
 
     @torch.inference_mode()
     def decode_one(
@@ -431,7 +509,7 @@ class QwenPrefillRunner:
             raise ValueError("KV Cache device 与模型权重不一致")
 
     def _validate_paged_batch_layout(
-        self, cache: PagedBatchDecodeAdapter, batch_size: int
+        self, cache: PagedBatchDecodeAdapter | PagedBatchPrefillAdapter, batch_size: int
     ) -> None:
         """校验 batch Adapter 与模型的静态布局，不读取或 gather 物理 K/V。"""
         expected = {
