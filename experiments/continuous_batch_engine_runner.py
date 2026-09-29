@@ -38,6 +38,11 @@ def parse_args() -> argparse.Namespace:
         choices=("masked", "segmented_sdpa"),
         default="masked",
     )
+    parser.add_argument(
+        "--prefill-kv-write-backend",
+        choices=("scalar", "vectorized"),
+        default="vectorized",
+    )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument(
         "--output-dir",
@@ -151,6 +156,7 @@ def render_report(result: dict[str, Any]) -> str:
         f"- model: `{result['model']}`",
         f"- block size: `{result['block_size']}`",
         f"- Prefill attention backend: `{result['prefill_attention_backend']}`",
+        f"- Prefill KV write backend: `{result['prefill_kv_write_backend']}`",
         f"- git commit: `{result['environment_after'].get('git_commit')}` "
         f"(dirty={result['environment_after'].get('git_dirty')})",
         f"- overall passed: `{result['gate']['passed']}`",
@@ -236,6 +242,7 @@ def main() -> None:
         runner=runner,
         admission=admission,
         prefill_attention_backend=args.prefill_attention_backend,
+        prefill_kv_write_backend=args.prefill_kv_write_backend,
     )
 
     def submit(request_id: str) -> None:
@@ -340,6 +347,7 @@ def main() -> None:
         "dtype": str(weights.embedding.dtype),
         "block_size": args.block_size,
         "prefill_attention_backend": args.prefill_attention_backend,
+        "prefill_kv_write_backend": args.prefill_kv_write_backend,
         "reference": "Hugging Face explicit greedy Prefill/Decode; no generate()",
         "request_specs": request_specs,
         "steps": step_records,

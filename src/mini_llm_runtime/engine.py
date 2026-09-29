@@ -62,11 +62,14 @@ class ContinuousBatchEngine:
         metrics: RequestMetricsCollector | None = None,
         enable_nvtx: bool = False,
         prefill_attention_backend: str = "masked",
+        prefill_kv_write_backend: str = "vectorized",
     ) -> None:
         if runner.decode_attention_backend != "paged_cuda":
             raise ValueError("ContinuousBatchEngine 需要 paged_cuda ModelRunner")
         if prefill_attention_backend not in {"masked", "segmented_sdpa"}:
             raise ValueError("prefill_attention_backend 必须是 masked 或 segmented_sdpa")
+        if prefill_kv_write_backend not in {"scalar", "vectorized"}:
+            raise ValueError("prefill_kv_write_backend 必须是 scalar 或 vectorized")
         storage = admission.manager.storage
         expected = (
             runner.config.num_hidden_layers,
@@ -96,6 +99,7 @@ class ContinuousBatchEngine:
         self.metrics = metrics or RequestMetricsCollector()
         self.enable_nvtx = enable_nvtx
         self.prefill_attention_backend = prefill_attention_backend
+        self.prefill_kv_write_backend = prefill_kv_write_backend
 
     @property
     def manager(self):
@@ -180,6 +184,7 @@ class ContinuousBatchEngine:
                         self.manager,
                         prefill_ids,
                         tuple(len(item.input_token_ids) for item in prefill_items),
+                        write_backend=self.prefill_kv_write_backend,
                     )
                     output = self.runner.prefill_batch(
                         input_ids,

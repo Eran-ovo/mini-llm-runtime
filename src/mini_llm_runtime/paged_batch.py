@@ -208,7 +208,7 @@ class PagedBatchPrefillAdapter:
     """把多个空请求的 packed Prefill 写入各自的物理 KV block。
 
     `lengths[i]` 对应 `request_ids[i]`；所有层成功后才一起提交长度。
-    这个版本复用正确性优先的逐 token storage 写入，后续可替换成 CUDA kernel。
+    默认使用批量物理 slot 索引写入；scalar 路径保留为独立正确性基线。
     """
 
     def __init__(
@@ -216,6 +216,8 @@ class PagedBatchPrefillAdapter:
         manager: PagedKVCacheManager,
         request_ids: tuple[str, ...],
         lengths: tuple[int, ...],
+        *,
+        write_backend: str = "vectorized",
     ) -> None:
         if not request_ids or len(request_ids) != len(lengths):
             raise ValueError("Prefill request_ids 与 lengths 必须非空且等长")
@@ -223,12 +225,16 @@ class PagedBatchPrefillAdapter:
             raise ValueError("Prefill batch 不能包含重复 request_id")
         if any(length <= 0 for length in lengths):
             raise ValueError("Prefill lengths 必须全部 > 0")
+        if write_backend not in {"scalar", "vectorized"}:
+            raise ValueError("write_backend 必须是 scalar 或 vectorized")
         self.manager = manager
         self.request_ids = tuple(request_ids)
         self.lengths = tuple(lengths)
+        self.write_backend = write_backend
         self._tables = tuple(manager.get_request(rid) for rid in request_ids)
         self._active = False
         self._written_layers = [False] * self.num_layers
+        self._physical_indices: tuple[torch.Tensor, torch.Tensor] | None = None
 
     @property
     def batch_size(self) -> int:
@@ -277,9 +283,32 @@ class PagedBatchPrefillAdapter:
             for table, length in zip(self._tables, self.lengths, strict=True):
                 table.begin_append(length)
                 begun.append(table)
+            if self.write_backend == "vectorized":
+                # 地址只随本轮 append 改变，24 层复用同一对 GPU 索引。
+                locations = [
+                    table.locate(table.pending.start + index, include_pending=True)
+                    for table in self._tables
+                    for index in range(table.pending.token_count)
+                ]
+                pairs = tuple((item.block_id, item.block_offset) for item in locations)
+                if len(set(pairs)) != len(pairs):
+                    raise RuntimeError("packed Prefill 存在重复物理 slot")
+                self._physical_indices = (
+                    torch.tensor(
+                        [item.block_id for item in locations],
+                        dtype=torch.long,
+                        device=self.device,
+                    ),
+                    torch.tensor(
+                        [item.block_offset for item in locations],
+                        dtype=torch.long,
+                        device=self.device,
+                    ),
+                )
         except Exception:
             for table in reversed(begun):
                 table.abort_append()
+            self._physical_indices = None
             raise
         self._active = True
         self._written_layers = [False] * self.num_layers
@@ -296,12 +325,27 @@ class PagedBatchPrefillAdapter:
         expected = (1, self.num_kv_heads, self.offsets[-1], self.head_dim)
         if tuple(key.shape) != expected or tuple(value.shape) != expected:
             raise ValueError(f"packed K/V 必须是 {expected}")
-        for table, start, end in zip(
-            self._tables, self.offsets[:-1], self.offsets[1:], strict=True
-        ):
-            self.manager.storage.write_layer(
-                table, layer_index, key[0, :, start:end], value[0, :, start:end]
-            )
+        if self.write_backend == "vectorized":
+            if key.dtype != self.dtype or value.dtype != self.dtype:
+                raise ValueError("packed K/V dtype 必须与 Paged storage 相同")
+            if key.device != self.device or value.device != self.device:
+                raise ValueError("packed K/V device 必须与 Paged storage 相同")
+            if self._physical_indices is None:
+                raise RuntimeError("缺少 Prefill 物理 slot 索引")
+            blocks, offsets = self._physical_indices
+            storage = self.manager.storage
+            # storage 是 [layer,block,kv_head,block_offset,head_dim]。
+            # 两个高级索引配对选择 [token,kv_head,head_dim]，不能只将
+            # [block,offset] 当作连续 flat slot 再 reshape storage。
+            storage.key[layer_index, blocks, :, offsets, :] = key[0].transpose(0, 1)
+            storage.value[layer_index, blocks, :, offsets, :] = value[0].transpose(0, 1)
+        else:
+            for table, start, end in zip(
+                self._tables, self.offsets[:-1], self.offsets[1:], strict=True
+            ):
+                self.manager.storage.write_layer(
+                    table, layer_index, key[0, :, start:end], value[0, :, start:end]
+                )
         self._written_layers[layer_index] = True
 
     def commit_prefill(self) -> None:
@@ -313,6 +357,7 @@ class PagedBatchPrefillAdapter:
         for table in self._tables:
             table.commit_append()
         self._active = False
+        self._physical_indices = None
 
     def abort_prefill(self) -> None:
         if not self._active:
@@ -321,3 +366,4 @@ class PagedBatchPrefillAdapter:
             table.abort_append()
         self._active = False
         self._written_layers = [False] * self.num_layers
+        self._physical_indices = None

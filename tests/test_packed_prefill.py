@@ -29,7 +29,10 @@ def make_manager(runner):
 
 @pytest.mark.parametrize("order", [("A", "B", "C"), ("C", "A", "B")])
 @pytest.mark.parametrize("attention_backend", ["masked", "segmented_sdpa"])
-def test_packed_prefill_matches_independent_requests_and_cache(order, attention_backend):
+@pytest.mark.parametrize("write_backend", ["scalar", "vectorized"])
+def test_packed_prefill_matches_independent_requests_and_cache(
+    order, attention_backend, write_backend
+):
     runner, _ = make_runner()
     packed_manager = make_manager(runner)
     reference_manager = make_manager(runner)
@@ -38,7 +41,9 @@ def test_packed_prefill_matches_independent_requests_and_cache(order, attention_
         reference_manager.create_request(request_id)
 
     lengths = tuple(len(PROMPTS[request_id]) for request_id in order)
-    adapter = PagedBatchPrefillAdapter(packed_manager, order, lengths)
+    adapter = PagedBatchPrefillAdapter(
+        packed_manager, order, lengths, write_backend=write_backend
+    )
     tokens = torch.tensor(
         [[token for request_id in order for token in PROMPTS[request_id]]]
     )
@@ -95,12 +100,15 @@ def test_packed_prefill_rejects_unknown_attention_backend_before_mutation():
     assert manager.allocator.free_count == manager.allocator.total_blocks
 
 
-def test_packed_prefill_failure_aborts_all_requests(monkeypatch):
+@pytest.mark.parametrize("write_backend", ["scalar", "vectorized"])
+def test_packed_prefill_failure_aborts_all_requests(monkeypatch, write_backend):
     runner, _ = make_runner()
     manager = make_manager(runner)
     for request_id in ("A", "B"):
         manager.create_request(request_id)
-    adapter = PagedBatchPrefillAdapter(manager, ("A", "B"), (3, 1))
+    adapter = PagedBatchPrefillAdapter(
+        manager, ("A", "B"), (3, 1), write_backend=write_backend
+    )
     original_write = adapter.write_layer
 
     def fail_on_second_layer(layer_index, key, value):

@@ -40,6 +40,11 @@ def parse_args() -> argparse.Namespace:
         help="额外与分段 SDPA Prefill 交错比较，只改变 Attention backend",
     )
     parser.add_argument(
+        "--compare-vectorized-kv-write",
+        action="store_true",
+        help="额外与批量物理 slot 写入交错比较，只改变 KV 写入 backend",
+    )
+    parser.add_argument(
         "--fixed-prompt-length",
         type=int,
         help="把四条 token 序列循环扩展到相同长度；用于扫描 Attention 形状",
@@ -121,7 +126,17 @@ def main() -> None:
         return torch.cat(outputs, dim=0)
 
     def packed(manager):
-        adapter = PagedBatchPrefillAdapter(manager, request_ids, lengths)
+        adapter = PagedBatchPrefillAdapter(
+            manager, request_ids, lengths, write_backend="scalar"
+        )
+        return runner.prefill_batch(
+            packed_input, cache=adapter, attention_backend="masked"
+        ).logits[:, -1]
+
+    def packed_vectorized(manager):
+        adapter = PagedBatchPrefillAdapter(
+            manager, request_ids, lengths, write_backend="vectorized"
+        )
         return runner.prefill_batch(
             packed_input, cache=adapter, attention_backend="masked"
         ).logits[:, -1]
@@ -193,6 +208,8 @@ def main() -> None:
     correctness = {"packed": compare_to_serial(packed)}
     if args.compare_segmented_sdpa:
         correctness["segmented"] = compare_to_serial(segmented)
+    if args.compare_vectorized_kv_write:
+        correctness["packed_vectorized"] = compare_to_serial(packed_vectorized)
     del serial_manager
 
     cases = {
@@ -201,6 +218,10 @@ def main() -> None:
     }
     if args.compare_segmented_sdpa:
         cases["segmented"] = CudaBenchmarkCase(operation=segmented, prepare=prepare)
+    if args.compare_vectorized_kv_write:
+        cases["packed_vectorized"] = CudaBenchmarkCase(
+            operation=packed_vectorized, prepare=prepare
+        )
     results = measure_cuda_interleaved(
         cases,
         warmup=args.warmup,
@@ -239,6 +260,11 @@ def main() -> None:
             (results["segmented"].median_ms / results["packed"].median_ms - 1)
             * 100
         )
+    if args.compare_vectorized_kv_write:
+        result["vectorized_vs_packed_median_percent"] = (
+            (results["packed_vectorized"].median_ms / results["packed"].median_ms - 1)
+            * 100
+        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     target = args.output_dir / "result.json"
     target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -249,8 +275,13 @@ def main() -> None:
         "segmented_median_ms": (
             results["segmented"].median_ms if args.compare_segmented_sdpa else None
         ),
+        "packed_vectorized_median_ms": (
+            results["packed_vectorized"].median_ms
+            if args.compare_vectorized_kv_write else None
+        ),
         "packed_vs_serial_median_percent": result["packed_vs_serial_median_percent"],
         "segmented_vs_packed_median_percent": result.get("segmented_vs_packed_median_percent"),
+        "vectorized_vs_packed_median_percent": result.get("vectorized_vs_packed_median_percent"),
         "result": str(target),
     }, ensure_ascii=False, indent=2))
 
