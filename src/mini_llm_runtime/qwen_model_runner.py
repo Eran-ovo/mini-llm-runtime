@@ -83,6 +83,7 @@ def _attention(
     layer_index: int | None = None,
     use_paged_decode_attention: bool = False,
     packed_causal_mask: torch.Tensor | None = None,
+    packed_segments: tuple[tuple[int, int], ...] | None = None,
 ) -> torch.Tensor:
     query = _heads(
         F.linear(x, weights.q_proj.weight, weights.q_proj.bias),
@@ -137,27 +138,43 @@ def _attention(
         key = _repeat_kv(key, config.gqa_group_size)
         value = _repeat_kv(value, config.gqa_group_size)
 
-        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(config.head_dim)
-        if packed_causal_mask is not None:
-            # 同一请求只能看见本请求过去和当前 token；不同请求的分数必须遮住。
-            scores = scores.masked_fill(
-                ~packed_causal_mask[None, None], torch.finfo(x.dtype).min
+        if packed_segments is not None:
+            # Q/K/V Projection 已对所有请求合批；Attention 按边界分别执行，
+            # 从而只处理 sum(length_i²) 个因果关系，不生成 [T,T] 跨请求矩阵。
+            per_head = torch.cat(
+                [
+                    F.scaled_dot_product_attention(
+                        query[:, :, start:end],
+                        key[:, :, start:end],
+                        value[:, :, start:end],
+                        is_causal=True,
+                    )
+                    for start, end in packed_segments
+                ],
+                dim=2,
             )
-        elif apply_causal_mask:
-            key_length = key.shape[2]
-            if query_length != key_length:
-                raise ValueError("当前 causal mask 只支持 Prefill 的方形 attention")
-            future = torch.triu(
-                torch.ones(
-                    (query_length, key_length), device=x.device, dtype=torch.bool
-                ),
-                diagonal=1,
-            )
-            scores = scores.masked_fill(
-                future[None, None], torch.finfo(x.dtype).min
-            )
-        probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
-        per_head = torch.matmul(probabilities, value)
+        else:
+            scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(config.head_dim)
+            if packed_causal_mask is not None:
+                # 同一请求只能看见本请求过去和当前 token；不同请求的分数必须遮住。
+                scores = scores.masked_fill(
+                    ~packed_causal_mask[None, None], torch.finfo(x.dtype).min
+                )
+            elif apply_causal_mask:
+                key_length = key.shape[2]
+                if query_length != key_length:
+                    raise ValueError("当前 causal mask 只支持 Prefill 的方形 attention")
+                future = torch.triu(
+                    torch.ones(
+                        (query_length, key_length), device=x.device, dtype=torch.bool
+                    ),
+                    diagonal=1,
+                )
+                scores = scores.masked_fill(
+                    future[None, None], torch.finfo(x.dtype).min
+                )
+            probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(x.dtype)
+            per_head = torch.matmul(probabilities, value)
     merged = (
         per_head.transpose(1, 2)
         .contiguous()
@@ -177,6 +194,7 @@ def _decoder_layer(
     layer_index: int | None = None,
     use_paged_decode_attention: bool = False,
     packed_causal_mask: torch.Tensor | None = None,
+    packed_segments: tuple[tuple[int, int], ...] | None = None,
 ) -> torch.Tensor:
     residual = x
     x = _rms_norm(x, weights.input_norm, config.rms_norm_eps)
@@ -190,6 +208,7 @@ def _decoder_layer(
         layer_index=layer_index,
         use_paged_decode_attention=use_paged_decode_attention,
         packed_causal_mask=packed_causal_mask,
+        packed_segments=packed_segments,
     )
     residual = x
     x = _rms_norm(x, weights.post_attention_norm, config.rms_norm_eps)
@@ -280,12 +299,14 @@ class QwenPrefillRunner:
         input_ids: torch.Tensor,
         *,
         cache: PagedBatchPrefillAdapter,
+        attention_backend: str = "masked",
     ) -> QwenPrefillOutput:
         """一次模型前向处理多个无 padding prompt，返回每条请求末位 logits。
 
         `input_ids` 为 `[1,total_tokens]`，依照 `cache.request_ids` 顺序拼接。
-        这里用块对角 causal mask 定义正确语义；大 prompt 的高效 varlen
-        attention 是后续单独优化的目标。
+        `masked` 是默认延迟路径；`segmented_sdpa` 逐请求调用 PyTorch SDPA，
+        避免分配总 token 数平方大小的 score/probability tensor，供显存受限
+        的长 prompt 实验使用。它并非一次 fused varlen Attention 调用。
         """
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError("Packed Prefill input_ids 必须是 [1,total_tokens]")
@@ -299,18 +320,27 @@ class QwenPrefillRunner:
             raise ValueError("至少一个 prompt 超过 max_position_embeddings")
         if cache.active:
             raise ValueError("Prefill 开始前不能存在 active transaction")
+        if attention_backend not in {"masked", "segmented_sdpa"}:
+            raise ValueError("attention_backend 必须是 masked 或 segmented_sdpa")
 
         # position 每遇到新请求都归零。segment_id 用于阻止跨请求 Attention。
         positions_cpu = [position for length in cache.lengths for position in range(length)]
-        segment_cpu = [index for index, length in enumerate(cache.lengths) for _ in range(length)]
         positions = torch.tensor(
             (positions_cpu,), dtype=torch.long, device=input_ids.device
         )
-        segment_ids = torch.tensor(segment_cpu, device=input_ids.device)
-        indices = torch.arange(offsets[-1], device=input_ids.device)
-        causal_mask = (segment_ids[:, None] == segment_ids[None, :]) & (
-            indices[:, None] >= indices[None, :]
-        )
+        causal_mask = None
+        segments = None
+        if attention_backend == "masked":
+            segment_cpu = [
+                index for index, length in enumerate(cache.lengths) for _ in range(length)
+            ]
+            segment_ids = torch.tensor(segment_cpu, device=input_ids.device)
+            indices = torch.arange(offsets[-1], device=input_ids.device)
+            causal_mask = (segment_ids[:, None] == segment_ids[None, :]) & (
+                indices[:, None] >= indices[None, :]
+            )
+        else:
+            segments = tuple(zip(offsets[:-1], offsets[1:], strict=True))
 
         x = F.embedding(input_ids, self.weights.embedding)
         cache.begin_prefill()
@@ -325,6 +355,7 @@ class QwenPrefillRunner:
                     cache=cache,
                     layer_index=layer_index,
                     packed_causal_mask=causal_mask,
+                    packed_segments=segments,
                 )
             # 只对每个 prompt 的末位执行 LM Head，避免分配 [T,vocab] logits。
             last_indices = torch.tensor(

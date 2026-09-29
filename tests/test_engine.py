@@ -48,6 +48,7 @@ def make_engine(
     *,
     batching_policy: BatchingPolicy = BatchingPolicy.CONTINUOUS,
     max_mixed_prefill_tokens: int | None = None,
+    prefill_attention_backend: str = "masked",
 ) -> tuple[ContinuousBatchEngine, RequestScheduler, PagedBlockAdmissionController]:
     base, weights = make_runner()
     runner = QwenPrefillRunner(
@@ -93,7 +94,10 @@ def make_engine(
     )
     return (
         ContinuousBatchEngine(
-            scheduler=scheduler, runner=runner, admission=admission
+            scheduler=scheduler,
+            runner=runner,
+            admission=admission,
+            prefill_attention_backend=prefill_attention_backend,
         ),
         scheduler,
         admission,
@@ -104,14 +108,14 @@ def test_engine_packs_same_step_prefill_into_one_runner_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine, _, _ = make_engine(monkeypatch)
-    calls: list[tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]] = []
+    calls: list[tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...], str]] = []
     original = engine.runner.prefill_batch
 
-    def observed(input_ids: torch.Tensor, *, cache):
+    def observed(input_ids: torch.Tensor, *, cache, attention_backend):
         calls.append(
-            (cache.request_ids, cache.lengths, tuple(input_ids[0].tolist()))
+            (cache.request_ids, cache.lengths, tuple(input_ids[0].tolist()), attention_backend)
         )
-        return original(input_ids, cache=cache)
+        return original(input_ids, cache=cache, attention_backend=attention_backend)
 
     monkeypatch.setattr(engine.runner, "prefill_batch", observed)
     engine.submit("A", (1, 2, 3), max_new_tokens=2)
@@ -119,8 +123,23 @@ def test_engine_packs_same_step_prefill_into_one_runner_call(
     result = engine.step()
 
     assert result is not None
-    assert calls == [(('A', 'B'), (3, 2), (1, 2, 3, 4, 0))]
+    assert calls == [(('A', 'B'), (3, 2), (1, 2, 3, 4, 0), 'masked')]
     assert result.batch.prefill_request_ids == ("A", "B")
+
+
+def test_engine_segmented_prefill_matches_default_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outputs = []
+    for backend in ("masked", "segmented_sdpa"):
+        engine, scheduler, _ = make_engine(
+            monkeypatch, prefill_attention_backend=backend
+        )
+        engine.submit("A", (1, 2, 3), max_new_tokens=1)
+        engine.submit("B", (4, 0), max_new_tokens=1)
+        assert engine.step() is not None
+        outputs.append(tuple(scheduler.get_request(rid).generated_token_ids for rid in ("A", "B")))
+    assert outputs[0] == outputs[1]
 
 
 def test_engine_runs_prefill_mixed_decode_and_releases_finished(

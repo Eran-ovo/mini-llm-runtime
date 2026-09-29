@@ -61,9 +61,12 @@ class ContinuousBatchEngine:
         clock_ns: Callable[[], int] = time.perf_counter_ns,
         metrics: RequestMetricsCollector | None = None,
         enable_nvtx: bool = False,
+        prefill_attention_backend: str = "masked",
     ) -> None:
         if runner.decode_attention_backend != "paged_cuda":
             raise ValueError("ContinuousBatchEngine 需要 paged_cuda ModelRunner")
+        if prefill_attention_backend not in {"masked", "segmented_sdpa"}:
+            raise ValueError("prefill_attention_backend 必须是 masked 或 segmented_sdpa")
         storage = admission.manager.storage
         expected = (
             runner.config.num_hidden_layers,
@@ -92,6 +95,7 @@ class ContinuousBatchEngine:
         self._clock_ns = clock_ns
         self.metrics = metrics or RequestMetricsCollector()
         self.enable_nvtx = enable_nvtx
+        self.prefill_attention_backend = prefill_attention_backend
 
     @property
     def manager(self):
@@ -177,7 +181,11 @@ class ContinuousBatchEngine:
                         prefill_ids,
                         tuple(len(item.input_token_ids) for item in prefill_items),
                     )
-                    output = self.runner.prefill_batch(input_ids, cache=adapter)
+                    output = self.runner.prefill_batch(
+                        input_ids,
+                        cache=adapter,
+                        attention_backend=self.prefill_attention_backend,
+                    )
                     prefill_tokens = output.logits[:, -1].argmax(dim=-1)
                     for index, request_id in enumerate(prefill_ids):
                         selected_tokens[request_id] = prefill_tokens[index : index + 1]

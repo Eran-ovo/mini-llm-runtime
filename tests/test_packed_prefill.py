@@ -28,7 +28,8 @@ def make_manager(runner):
 
 
 @pytest.mark.parametrize("order", [("A", "B", "C"), ("C", "A", "B")])
-def test_packed_prefill_matches_independent_requests_and_cache(order):
+@pytest.mark.parametrize("attention_backend", ["masked", "segmented_sdpa"])
+def test_packed_prefill_matches_independent_requests_and_cache(order, attention_backend):
     runner, _ = make_runner()
     packed_manager = make_manager(runner)
     reference_manager = make_manager(runner)
@@ -41,7 +42,9 @@ def test_packed_prefill_matches_independent_requests_and_cache(order):
     tokens = torch.tensor(
         [[token for request_id in order for token in PROMPTS[request_id]]]
     )
-    packed = runner.prefill_batch(tokens, cache=adapter)
+    packed = runner.prefill_batch(
+        tokens, cache=adapter, attention_backend=attention_backend
+    )
     assert packed.logits.shape == (len(order), 1, runner.config.vocab_size)
     assert adapter.offsets == tuple(
         sum(lengths[:index]) for index in range(len(lengths) + 1)
@@ -76,6 +79,19 @@ def test_packed_prefill_rejects_invalid_metadata_without_cache_mutation():
         runner.prefill_batch(torch.tensor([[1, 2, 3]]), cache=adapter)
     assert manager.get_request("A").pending is None
     assert manager.get_request("A").token_count == 0
+    assert manager.allocator.free_count == manager.allocator.total_blocks
+
+
+def test_packed_prefill_rejects_unknown_attention_backend_before_mutation():
+    runner, _ = make_runner()
+    manager = make_manager(runner)
+    manager.create_request("A")
+    adapter = PagedBatchPrefillAdapter(manager, ("A",), (2,))
+    with pytest.raises(ValueError, match="attention_backend"):
+        runner.prefill_batch(
+            torch.tensor([[1, 2]]), cache=adapter, attention_backend="unknown"
+        )
+    assert manager.get_request("A").pending is None
     assert manager.allocator.free_count == manager.allocator.total_blocks
 
 

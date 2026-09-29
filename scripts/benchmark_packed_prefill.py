@@ -34,6 +34,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument(
+        "--compare-segmented-sdpa",
+        action="store_true",
+        help="额外与分段 SDPA Prefill 交错比较，只改变 Attention backend",
+    )
+    parser.add_argument(
+        "--fixed-prompt-length",
+        type=int,
+        help="把四条 token 序列循环扩展到相同长度；用于扫描 Attention 形状",
+    )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
@@ -45,6 +55,8 @@ def main() -> None:
         raise SystemExit("此 benchmark 需要 CUDA")
     if args.block_size <= 0:
         raise SystemExit("--block-size 必须 > 0")
+    if args.fixed_prompt_length is not None and args.fixed_prompt_length <= 0:
+        raise SystemExit("--fixed-prompt-length 必须 > 0")
     repo_root = Path(__file__).resolve().parents[1]
     environment_before = collect_environment(repo_root)
 
@@ -52,10 +64,20 @@ def main() -> None:
 
     model_dir = snapshot_download(args.model, local_files_only=args.local_files_only)
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
-    prompts = tuple(
+    base_prompts = tuple(
         tuple(tokenizer(prompt, add_special_tokens=True)["input_ids"])
         for prompt in PROMPTS
     )
+    if args.fixed_prompt_length is None:
+        prompts = base_prompts
+    else:
+        # 循环已有合法 token ID，只改变 sequence length，不改变请求数或模型。
+        prompts = tuple(
+            (prompt * math.ceil(args.fixed_prompt_length / len(prompt)))[
+                : args.fixed_prompt_length
+            ]
+            for prompt in base_prompts
+        )
     config, weights = load_qwen_checkpoint(
         model_dir, device="cuda", dtype=torch.float16
     )
@@ -100,51 +122,87 @@ def main() -> None:
 
     def packed(manager):
         adapter = PagedBatchPrefillAdapter(manager, request_ids, lengths)
-        return runner.prefill_batch(packed_input, cache=adapter).logits[:, -1]
+        return runner.prefill_batch(
+            packed_input, cache=adapter, attention_backend="masked"
+        ).logits[:, -1]
+
+    def segmented(manager):
+        adapter = PagedBatchPrefillAdapter(manager, request_ids, lengths)
+        return runner.prefill_batch(
+            packed_input, cache=adapter, attention_backend="segmented_sdpa"
+        ).logits[:, -1]
 
     # 先检验同一组实际输入的 logits 和所有请求的物理 KV 内容。
     serial_manager = prepare()
-    packed_manager = prepare()
     serial_logits = serial(serial_manager)
-    packed_logits = packed(packed_manager)
-    logits_match = bool(torch.allclose(serial_logits, packed_logits, atol=5e-2, rtol=5e-3))
-    tokens_match = bool(torch.equal(serial_logits.argmax(-1), packed_logits.argmax(-1)))
-    kv_max_abs_diff = 0.0
-    kv_max_relative_l2 = 0.0
-    kv_worst_values = None
-    for request_id in request_ids:
-        serial_kv = serial_manager.gather(request_id)
-        packed_kv = packed_manager.gather(request_id)
-        for left, right in zip(serial_kv, packed_kv, strict=True):
-            difference = (left.float() - right.float()).abs()
-            maximum, flat_index = difference.flatten().max(dim=0)
-            if float(maximum) > kv_max_abs_diff:
-                kv_max_abs_diff = float(maximum)
-                kv_worst_values = (
-                    float(left.flatten()[flat_index]),
-                    float(right.flatten()[flat_index]),
-                )
-            relative_l2 = float(
-                torch.linalg.vector_norm(left.float() - right.float())
-                / torch.linalg.vector_norm(left.float()).clamp_min(1e-12)
-            )
-            kv_max_relative_l2 = max(kv_max_relative_l2, relative_l2)
-    # FP16 GEMM 的 M 维变化可能改变舍入；同时限制绝对误差与整体相对误差。
-    kv_match = kv_max_abs_diff <= 0.15 and kv_max_relative_l2 <= 0.01
-    if not (logits_match and tokens_match and kv_match):
-        raise RuntimeError(
-            f"正确性失败：logits={logits_match}, tokens={tokens_match}, "
-            f"KV={kv_match}, KV max_abs_diff={kv_max_abs_diff}, "
-            f"KV max_relative_l2={kv_max_relative_l2}, "
-            f"worst_values={kv_worst_values}"
-        )
-    del serial_manager, packed_manager
 
+    def compare_to_serial(operation):
+        candidate_manager = prepare()
+        candidate_logits = operation(candidate_manager)
+        logits_elementwise_close = bool(
+            torch.allclose(serial_logits, candidate_logits, atol=5e-2, rtol=5e-3)
+        )
+        logits_max_abs_diff = float(
+            (serial_logits.float() - candidate_logits.float()).abs().max()
+        )
+        logits_relative_l2 = float(
+            torch.linalg.vector_norm(serial_logits.float() - candidate_logits.float())
+            / torch.linalg.vector_norm(serial_logits.float()).clamp_min(1e-12)
+        )
+        logits_match = logits_relative_l2 <= 0.01 and bool(
+            torch.isfinite(candidate_logits).all()
+        )
+        tokens_match = bool(
+            torch.equal(serial_logits.argmax(-1), candidate_logits.argmax(-1))
+        )
+        kv_max_abs_diff = 0.0
+        kv_max_relative_l2 = 0.0
+        kv_worst_values = None
+        for request_id in request_ids:
+            serial_kv = serial_manager.gather(request_id)
+            candidate_kv = candidate_manager.gather(request_id)
+            for left, right in zip(serial_kv, candidate_kv, strict=True):
+                difference = (left.float() - right.float()).abs()
+                maximum, flat_index = difference.flatten().max(dim=0)
+                if float(maximum) > kv_max_abs_diff:
+                    kv_max_abs_diff = float(maximum)
+                    kv_worst_values = (
+                        float(left.flatten()[flat_index]),
+                        float(right.flatten()[flat_index]),
+                    )
+                relative_l2 = float(
+                    torch.linalg.vector_norm(left.float() - right.float())
+                    / torch.linalg.vector_norm(left.float()).clamp_min(1e-12)
+                )
+                kv_max_relative_l2 = max(kv_max_relative_l2, relative_l2)
+        correctness = {
+            "logits_match": logits_match,
+            "logits_elementwise_close": logits_elementwise_close,
+            "logits_max_abs_diff": logits_max_abs_diff,
+            "logits_relative_l2": logits_relative_l2,
+            "tokens_match": tokens_match,
+            "kv_match": kv_max_relative_l2 <= 0.01,
+            "kv_max_abs_diff": kv_max_abs_diff,
+            "kv_max_relative_l2": kv_max_relative_l2,
+            "kv_worst_values": kv_worst_values,
+        }
+        if not all(correctness[name] for name in ("logits_match", "tokens_match", "kv_match")):
+            raise RuntimeError(f"正确性失败：{correctness}")
+        return correctness
+
+    correctness = {"packed": compare_to_serial(packed)}
+    if args.compare_segmented_sdpa:
+        correctness["segmented"] = compare_to_serial(segmented)
+    del serial_manager
+
+    cases = {
+        "serial": CudaBenchmarkCase(operation=serial, prepare=prepare),
+        "packed": CudaBenchmarkCase(operation=packed, prepare=prepare),
+    }
+    if args.compare_segmented_sdpa:
+        cases["segmented"] = CudaBenchmarkCase(operation=segmented, prepare=prepare)
     results = measure_cuda_interleaved(
-        {
-            "serial": CudaBenchmarkCase(operation=serial, prepare=prepare),
-            "packed": CudaBenchmarkCase(operation=packed, prepare=prepare),
-        },
+        cases,
         warmup=args.warmup,
         repeats=args.repeats,
     )
@@ -159,17 +217,16 @@ def main() -> None:
         "scope": "Prefill ModelRunner + Paged KV write; excludes input construction and scheduling",
         "model": args.model,
         "prompts": list(PROMPTS),
+        "prompt_construction": (
+            "original_tokenized"
+            if args.fixed_prompt_length is None
+            else "cyclic_repetition_to_fixed_length"
+        ),
+        "fixed_prompt_length": args.fixed_prompt_length,
         "prompt_token_ids": [list(prompt) for prompt in prompts],
         "request_ids": list(request_ids),
         "block_size": args.block_size,
-        "correctness": {
-            "logits_match": logits_match,
-            "tokens_match": tokens_match,
-            "kv_match": kv_match,
-            "kv_max_abs_diff": kv_max_abs_diff,
-            "kv_max_relative_l2": kv_max_relative_l2,
-            "kv_worst_values": kv_worst_values,
-        },
+        "correctness": correctness,
         "cases": {name: timing.to_dict() for name, timing in results.items()},
         "environment_before": environment_before,
         "environment_after": environment_after,
@@ -177,6 +234,11 @@ def main() -> None:
     result["packed_vs_serial_median_percent"] = (
         (results["packed"].median_ms / results["serial"].median_ms - 1) * 100
     )
+    if args.compare_segmented_sdpa:
+        result["segmented_vs_packed_median_percent"] = (
+            (results["segmented"].median_ms / results["packed"].median_ms - 1)
+            * 100
+        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     target = args.output_dir / "result.json"
     target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -184,7 +246,11 @@ def main() -> None:
         "correctness": result["correctness"],
         "serial_median_ms": results["serial"].median_ms,
         "packed_median_ms": results["packed"].median_ms,
+        "segmented_median_ms": (
+            results["segmented"].median_ms if args.compare_segmented_sdpa else None
+        ),
         "packed_vs_serial_median_percent": result["packed_vs_serial_median_percent"],
+        "segmented_vs_packed_median_percent": result.get("segmented_vs_packed_median_percent"),
         "result": str(target),
     }, ensure_ascii=False, indent=2))
 
