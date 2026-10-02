@@ -149,11 +149,16 @@ def test_engine_packs_same_step_prefill_into_one_runner_call(
         ((64, 64, 64, 64), "masked"),
         ((128, 128, 128, 128), "segmented_sdpa"),
         ((256, 256, 256, 256), "segmented_sdpa"),
+        ((64,) * 8, "segmented_sdpa"),
+        ((32,) * 16, "segmented_sdpa"),
+        ((16,) * 32, "masked"),
+        ((128,) + (13,) * 31, "segmented_sdpa"),
+        ((8, 64, 128, 256), "masked"),
         ((1,) * 512, "masked"),
         ((128, 1), "masked"),
     ],
 )
-def test_auto_prefill_backend_uses_both_total_and_longest_prompt(
+def test_auto_prefill_backend_uses_total_longest_and_average_prompt(
     lengths: tuple[int, ...], expected: str
 ) -> None:
     assert select_prefill_attention_backend("auto", lengths) == expected
@@ -168,9 +173,20 @@ def test_explicit_prefill_backend_overrides_auto_shape() -> None:
         select_prefill_attention_backend("auto", (0, 512))
 
 
-def test_engine_auto_dispatches_long_packed_prefill() -> None:
+@pytest.mark.parametrize(
+    ("request_count", "prompt_length", "expected_backend"),
+    [
+        (4, 128, "segmented_sdpa"),
+        (8, 64, "segmented_sdpa"),
+        (16, 32, "segmented_sdpa"),
+        (32, 16, "masked"),
+    ],
+)
+def test_engine_auto_dispatches_packed_prefill_by_shape(
+    request_count: int, prompt_length: int, expected_backend: str
+) -> None:
     base, weights = make_runner()
-    config = replace(base.config, max_position_embeddings=128)
+    config = replace(base.config, max_position_embeddings=prompt_length)
     runner = QwenPrefillRunner(config, weights, decode_attention_backend="paged_cuda")
     manager = PagedKVCacheManager(
         total_blocks=256,
@@ -183,19 +199,22 @@ def test_engine_auto_dispatches_long_packed_prefill() -> None:
     )
     admission = PagedBlockAdmissionController(manager)
     scheduler = RequestScheduler(
-        max_running_requests=4,
+        max_running_requests=request_count,
         max_batch_tokens=512,
         admission_callback=admission.try_admit,
     )
     engine = ContinuousBatchEngine(
         scheduler=scheduler, runner=runner, admission=admission
     )
-    for index in range(4):
-        engine.submit(f"request-{index}", (1, 2, 3, 4) * 32, max_new_tokens=1)
+    for index in range(request_count):
+        engine.submit(
+            f"request-{index}", (1, 2, 3, 4) * (prompt_length // 4),
+            max_new_tokens=1,
+        )
     result = engine.step()
     assert result is not None
-    assert result.prefill_attention_backend == "segmented_sdpa"
-    assert len(result.update.finished_request_ids) == 4
+    assert result.prefill_attention_backend == expected_backend
+    assert len(result.update.finished_request_ids) == request_count
     assert manager.request_ids == ()
 
 

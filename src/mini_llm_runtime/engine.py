@@ -56,9 +56,12 @@ def select_prefill_attention_backend(
         return configured
     if not lengths or any(length <= 0 for length in lengths):
         raise ValueError("auto Prefill 需要非空且为正数的 prompt lengths")
-    # RTX 3060 上 4×64 几乎持平、4×128 开始有收益。
-    # 同时检查最长 prompt，避免很多极短请求触发大量 SDPA 调用。
-    if sum(lengths) >= 512 and max(lengths) >= 128:
+    total_tokens = sum(lengths)
+    # 保留旧的“存在长 prompt”分支；新增平均长度分支覆盖 8×64、16×32。
+    # 32×16 的分段调用开销已抵消收益，因此不能只看总 token 数。
+    if total_tokens >= 512 and (
+        max(lengths) >= 128 or total_tokens >= 32 * len(lengths)
+    ):
         return "segmented_sdpa"
     return "masked"
 

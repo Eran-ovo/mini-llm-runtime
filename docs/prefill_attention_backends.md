@@ -19,9 +19,10 @@ MLP 和 LM Head 调用。每个请求仍须只能读取自己的历史 token。
 `is_causal=True`。它不生成跨请求的 `[T,T]` scores；计算规模随
 `sum(Lᵢ²)` 增长。该实现每层仍有多次 Attention 调用，不是 fused varlen kernel。
 
-Engine 默认的 `auto` 在本轮总 token 数至少 512、最长 prompt 至少 128 时选
-`segmented_sdpa`，其他形状选 `masked`。这两个条件来自下方 RTX 3060 Laptop 的
-有限长度扫描：最长 prompt 条件避免大量极短请求仅因总数大就触发很多 SDPA 调用。
+Engine 默认的 `auto` 在本轮总 token 数至少 512，且满足“最长 prompt 至少 128”
+或“平均每请求至少 32 token”任一条件时选 `segmented_sdpa`，其他形状选
+`masked`。保留最长 prompt 条件，并用平均长度条件覆盖一批中等长度的请求；
+两者都不满足时，避免大量短请求触发过多 SDPA 调用。
 它是保守的单 GPU 启发式，不是通用最优调度器。显式指定 backend 始终覆盖 `auto`；
 每个 Engine step 的实际选择记录在 correctness artifact 的 `steps` 中。
 
@@ -75,3 +76,30 @@ masked 为 26.46 ms（`auto` 选它）；4×256 token 的 masked/segmented 分�
 1453.53/1055.99 MiB。三组均通过 logits、greedy token 和 KV 对拍，原始样本位于
 `benchmarks/results/v2_4_attention_len{8,256,512}_clean_7f4c844/`。
 8-token 组的路径差异与测量波动接近，不把它解释为短 prompt 的收益。
+
+## v2.5 变长请求校准
+
+在 clean-tree commit `af3280d` 上增加 `--prompt-lengths`，按四条已 tokenize 的
+短句循环构造任意请求数与长度。下表两条被计时的路径都使用 vectorized KV write；
+每组均先与逐请求 reference 对拍 logits、greedy token 和 KV，且每组包含 warmup、
+交错 CUDA Event 多轮原始样本。表内负数代表 segmented 更慢。
+
+| 请求长度 | 总 token | masked | segmented | segmented 降幅 | 旧 auto |
+|---|---:|---:|---:|---:|---|
+| 256,8,8,8 | 280 | 27.78 ms | 27.19 ms | 2.1% | masked |
+| 8,64,128,256 | 456 | 42.58 ms | 35.57 ms | 16.5% | masked |
+| 8×64 | 512 | 50.47 ms | 39.82 ms | 21.1% | masked |
+| 16×32 | 512 | 48.64 ms | 40.48 ms | 16.8% | masked |
+| 32×16 | 512 | 44.36 ms | 46.74 ms | -5.4% | masked |
+| 128 + 31×13 | 531 | 55.18 ms | 52.07 ms | 5.6% | segmented |
+
+8×64 的独立重复实验仍显示 segmented 快 16.5%；16×32 的独立重复实验为
+8.8%，但笔记本频率波动较明显，因此不把中位数差异当作通用保证。新规则只扩展
+`T≥512` 内的选择，8,64,128,256 这组当前仍会选 masked；后续需单独验证是否
+降低总 token 阈值，不在同一次优化里一起改变。原始 JSON 位于本地
+`benchmarks/results/v2_5_ragged_*_af3280d/`。
+
+失败实验：`(128,128,128,1)` 在计时前被 correctness gate 拦截。虽然 logits
+相对 L2 为 0.00668 且 greedy token 相同，逐请求 reference 与 packed KV 的最大
+相对 L2 为 0.01371，超过当前 0.01 门槛；因此没有正式 timing JSON，不能拿它
+调阈值。尚未确认这是 FP16 GEMM 形状舍入还是实现问题，不能为得到性能数字而放宽门槛。
