@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 from huggingface_hub import snapshot_download
 
+from mini_llm_runtime.engine import select_prefill_attention_backend
 from mini_llm_runtime.environment import collect_environment
 from mini_llm_runtime.paged_batch import PagedBatchPrefillAdapter
 from mini_llm_runtime.paged_kv_adapter import PagedRequestKVCache
@@ -26,6 +27,30 @@ PROMPTS = (
     "CUDA 是什么？",
     "Paged Attention 如何管理显存？",
 )
+
+
+def construct_prompts(
+    base_prompts: tuple[tuple[int, ...], ...],
+    *,
+    fixed_prompt_length: int | None = None,
+    prompt_lengths: tuple[int, ...] | None = None,
+) -> tuple[tuple[int, ...], ...]:
+    """用合法 token ID 构造等长或变长请求；不改变每条请求的 RoPE 起点。"""
+    if not base_prompts or any(not prompt for prompt in base_prompts):
+        raise ValueError("base_prompts 必须非空，且每条 prompt 至少有一个 token")
+    if fixed_prompt_length is not None and prompt_lengths is not None:
+        raise ValueError("fixed_prompt_length 与 prompt_lengths 不能同时指定")
+    if fixed_prompt_length is not None:
+        prompt_lengths = (fixed_prompt_length,) * len(base_prompts)
+    if prompt_lengths is None:
+        return base_prompts
+    if not prompt_lengths or any(length <= 0 for length in prompt_lengths):
+        raise ValueError("prompt_lengths 必须是非空的正整数序列")
+    expanded = []
+    for index, length in enumerate(prompt_lengths):
+        template = base_prompts[index % len(base_prompts)]
+        expanded.append((template * math.ceil(length / len(template)))[:length])
+    return tuple(expanded)
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,10 +69,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="额外与批量物理 slot 写入交错比较，只改变 KV 写入 backend",
     )
-    parser.add_argument(
+    shape = parser.add_mutually_exclusive_group()
+    shape.add_argument(
         "--fixed-prompt-length",
         type=int,
         help="把四条 token 序列循环扩展到相同长度；用于扫描 Attention 形状",
+    )
+    shape.add_argument(
+        "--prompt-lengths",
+        type=int,
+        nargs="+",
+        help="逐请求指定 token 数；模板 prompt 按四条短句循环复用",
     )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -62,6 +94,8 @@ def main() -> None:
         raise SystemExit("--block-size 必须 > 0")
     if args.fixed_prompt_length is not None and args.fixed_prompt_length <= 0:
         raise SystemExit("--fixed-prompt-length 必须 > 0")
+    if args.prompt_lengths is not None and any(length <= 0 for length in args.prompt_lengths):
+        raise SystemExit("--prompt-lengths 必须全部 > 0")
     repo_root = Path(__file__).resolve().parents[1]
     environment_before = collect_environment(repo_root)
 
@@ -73,16 +107,13 @@ def main() -> None:
         tuple(tokenizer(prompt, add_special_tokens=True)["input_ids"])
         for prompt in PROMPTS
     )
-    if args.fixed_prompt_length is None:
-        prompts = base_prompts
-    else:
-        # 循环已有合法 token ID，只改变 sequence length，不改变请求数或模型。
-        prompts = tuple(
-            (prompt * math.ceil(args.fixed_prompt_length / len(prompt)))[
-                : args.fixed_prompt_length
-            ]
-            for prompt in base_prompts
-        )
+    prompts = construct_prompts(
+        base_prompts,
+        fixed_prompt_length=args.fixed_prompt_length,
+        prompt_lengths=(
+            tuple(args.prompt_lengths) if args.prompt_lengths is not None else None
+        ),
+    )
     config, weights = load_qwen_checkpoint(
         model_dir, device="cuda", dtype=torch.float16
     )
@@ -237,13 +268,19 @@ def main() -> None:
         "classification": "formal_clean_tree" if clean_same_commit else "exploratory_dirty_tree",
         "scope": "Prefill ModelRunner + Paged KV write; excludes input construction and scheduling",
         "model": args.model,
-        "prompts": list(PROMPTS),
+        "prompts": [PROMPTS[index % len(PROMPTS)] for index in range(len(prompts))],
         "prompt_construction": (
             "original_tokenized"
-            if args.fixed_prompt_length is None
-            else "cyclic_repetition_to_fixed_length"
+            if args.fixed_prompt_length is None and args.prompt_lengths is None
+            else (
+                "cyclic_repetition_to_fixed_length"
+                if args.fixed_prompt_length is not None
+                else "cyclic_repetition_to_variable_lengths"
+            )
         ),
         "fixed_prompt_length": args.fixed_prompt_length,
+        "prompt_lengths": list(lengths),
+        "auto_attention_backend": select_prefill_attention_backend("auto", lengths),
         "prompt_token_ids": [list(prompt) for prompt in prompts],
         "request_ids": list(request_ids),
         "block_size": args.block_size,
@@ -265,6 +302,12 @@ def main() -> None:
             (results["packed_vectorized"].median_ms / results["packed"].median_ms - 1)
             * 100
         )
+    if args.compare_segmented_sdpa and args.compare_vectorized_kv_write:
+        # Attention 单变量比较：两边都使用 vectorized KV write。
+        result["segmented_vs_vectorized_median_percent"] = (
+            (results["segmented"].median_ms / results["packed_vectorized"].median_ms - 1)
+            * 100
+        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     target = args.output_dir / "result.json"
     target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -282,6 +325,8 @@ def main() -> None:
         "packed_vs_serial_median_percent": result["packed_vs_serial_median_percent"],
         "segmented_vs_packed_median_percent": result.get("segmented_vs_packed_median_percent"),
         "vectorized_vs_packed_median_percent": result.get("vectorized_vs_packed_median_percent"),
+        "segmented_vs_vectorized_median_percent": result.get("segmented_vs_vectorized_median_percent"),
+        "auto_attention_backend": result["auto_attention_backend"],
         "result": str(target),
     }, ensure_ascii=False, indent=2))
 
