@@ -20,6 +20,17 @@ Release bundle 不进入 Git；通过
 
 ## Formal Benchmark
 
+### v2.4 Packed Prefill Attention Dispatch
+
+- source commit：`7f4c844`，GPU：RTX 3060 Laptop，模型：Qwen2.5-0.5B FP16；
+- 路径：`benchmarks/results/v2_4_attention_len{8,256,512}_clean_7f4c844/`；
+- 比较时两种 Attention 均使用 vectorized KV write，只改变 Attention backend；
+- 8/256-token 组 warmup 3、measured 10，512-token 组 warmup 2、measured 6；
+- JSON 包含 CUDA Event 原始样本、median、peak memory、GPU/CUDA/PyTorch、Git commit
+  及 logits/token/KV 对拍；测量范围仅为 Prefill ModelRunner + KV 写入，不是 TTFT。
+
+详细原理、形状扫描和自动选择限制见 `docs/prefill_attention_backends.md`。
+
 ### Static vs Continuous Batching
 
 - release 路径：`release_candidate_e01c3c7/static_vs_continuous/`；

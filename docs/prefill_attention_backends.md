@@ -68,3 +68,10 @@ v2.3 批量写入后，在 clean-tree commit `3e3597e` 上对 4 个等长 prompt
 benchmark 目录不进 Git，复现时须重新运行并核对 commit、GPU 时钟和原始样本。
 本机 WSL 下的算子级 profiler 未给出可靠的逐 CUDA kernel 时间，因此只把上面
 CUDA Event 的多轮正式样本用于性能结论；不能据此声称某个具体 kernel 的占比。
+
+自动选择接入 Engine 后，在 clean-tree commit `7f4c844` 上复测：4×8 token 的
+masked 为 26.46 ms（`auto` 选它）；4×256 token 的 masked/segmented 分别为
+116.61/68.77 ms；4×512 token 分别为 372.13/136.47 ms，峰值显存分别为
+1453.53/1055.99 MiB。三组均通过 logits、greedy token 和 KV 对拍，原始样本位于
+`benchmarks/results/v2_4_attention_len{8,256,512}_clean_7f4c844/`。
+8-token 组的路径差异与测量波动接近，不把它解释为短 prompt 的收益。
