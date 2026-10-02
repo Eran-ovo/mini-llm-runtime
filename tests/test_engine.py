@@ -1,9 +1,15 @@
+from dataclasses import replace
+
 import pytest
 import torch
 
 import mini_llm_runtime.qwen_model_runner as model_runner_module
 from mini_llm_runtime.block_admission import PagedBlockAdmissionController
-from mini_llm_runtime.engine import ContinuousBatchEngine, _nvtx_range
+from mini_llm_runtime.engine import (
+    ContinuousBatchEngine,
+    _nvtx_range,
+    select_prefill_attention_backend,
+)
 from mini_llm_runtime.paged_attention import paged_decode_attention_reference
 from mini_llm_runtime.paged_kv_manager import PagedKVCacheManager
 from mini_llm_runtime.qwen_model_runner import QwenPrefillRunner
@@ -48,7 +54,7 @@ def make_engine(
     *,
     batching_policy: BatchingPolicy = BatchingPolicy.CONTINUOUS,
     max_mixed_prefill_tokens: int | None = None,
-    prefill_attention_backend: str = "masked",
+    prefill_attention_backend: str = "auto",
     prefill_kv_write_backend: str = "vectorized",
 ) -> tuple[ContinuousBatchEngine, RequestScheduler, PagedBlockAdmissionController]:
     base, weights = make_runner()
@@ -133,13 +139,71 @@ def test_engine_packs_same_step_prefill_into_one_runner_call(
     assert result is not None
     assert calls == [(('A', 'B'), (3, 2), (1, 2, 3, 4, 0), 'masked', 'vectorized')]
     assert result.batch.prefill_request_ids == ("A", "B")
+    assert result.prefill_attention_backend == "masked"
+
+
+@pytest.mark.parametrize(
+    ("lengths", "expected"),
+    [
+        ((8, 8, 8, 8), "masked"),
+        ((64, 64, 64, 64), "masked"),
+        ((128, 128, 128, 128), "segmented_sdpa"),
+        ((256, 256, 256, 256), "segmented_sdpa"),
+        ((1,) * 512, "masked"),
+        ((128, 1), "masked"),
+    ],
+)
+def test_auto_prefill_backend_uses_both_total_and_longest_prompt(
+    lengths: tuple[int, ...], expected: str
+) -> None:
+    assert select_prefill_attention_backend("auto", lengths) == expected
+
+
+def test_explicit_prefill_backend_overrides_auto_shape() -> None:
+    assert select_prefill_attention_backend("segmented_sdpa", (1,)) == "segmented_sdpa"
+    assert select_prefill_attention_backend("masked", (512,)) == "masked"
+    with pytest.raises(ValueError, match="lengths"):
+        select_prefill_attention_backend("auto", ())
+    with pytest.raises(ValueError, match="lengths"):
+        select_prefill_attention_backend("auto", (0, 512))
+
+
+def test_engine_auto_dispatches_long_packed_prefill() -> None:
+    base, weights = make_runner()
+    config = replace(base.config, max_position_embeddings=128)
+    runner = QwenPrefillRunner(config, weights, decode_attention_backend="paged_cuda")
+    manager = PagedKVCacheManager(
+        total_blocks=256,
+        block_size=2,
+        num_layers=config.num_hidden_layers,
+        num_kv_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        dtype=weights.embedding.dtype,
+        device=weights.embedding.device,
+    )
+    admission = PagedBlockAdmissionController(manager)
+    scheduler = RequestScheduler(
+        max_running_requests=4,
+        max_batch_tokens=512,
+        admission_callback=admission.try_admit,
+    )
+    engine = ContinuousBatchEngine(
+        scheduler=scheduler, runner=runner, admission=admission
+    )
+    for index in range(4):
+        engine.submit(f"request-{index}", (1, 2, 3, 4) * 32, max_new_tokens=1)
+    result = engine.step()
+    assert result is not None
+    assert result.prefill_attention_backend == "segmented_sdpa"
+    assert len(result.update.finished_request_ids) == 4
+    assert manager.request_ids == ()
 
 
 def test_engine_segmented_prefill_matches_default_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     outputs = []
-    for backend in ("masked", "segmented_sdpa"):
+    for backend in ("auto", "masked", "segmented_sdpa"):
         engine, scheduler, _ = make_engine(
             monkeypatch, prefill_attention_backend=backend
         )
@@ -147,7 +211,7 @@ def test_engine_segmented_prefill_matches_default_tokens(
         engine.submit("B", (4, 0), max_new_tokens=1)
         assert engine.step() is not None
         outputs.append(tuple(scheduler.get_request(rid).generated_token_ids for rid in ("A", "B")))
-    assert outputs[0] == outputs[1]
+    assert outputs[0] == outputs[1] == outputs[2]
 
 
 def test_engine_vectorized_kv_write_matches_scalar_tokens(

@@ -35,8 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-size", type=int, default=4)
     parser.add_argument(
         "--prefill-attention-backend",
-        choices=("masked", "segmented_sdpa"),
-        default="masked",
+        choices=("auto", "masked", "segmented_sdpa"),
+        default="auto",
     )
     parser.add_argument(
         "--prefill-kv-write-backend",
@@ -87,6 +87,7 @@ def record_step(result, manager: PagedKVCacheManager) -> dict[str, Any]:
         "step": result.batch.step_index,
         "token_count": result.batch.token_count,
         "prefill": result.batch.prefill_request_ids,
+        "prefill_attention_backend": result.prefill_attention_backend,
         "decode": result.batch.decode_request_ids,
         "finished": result.update.finished_request_ids,
         "released_blocks": {
@@ -150,12 +151,19 @@ def evaluate_gate(
 
 
 def render_report(result: dict[str, Any]) -> str:
+    selected_prefill_backends = [
+        (step["step"], step["prefill_attention_backend"])
+        for step in result["steps"]
+        if step["prefill"]
+    ]
     lines = [
         "# Continuous Batching End-to-End Correctness Gate",
         "",
         f"- model: `{result['model']}`",
         f"- block size: `{result['block_size']}`",
         f"- Prefill attention backend: `{result['prefill_attention_backend']}`",
+        "- Selected Prefill backend per step: "
+        f"`{selected_prefill_backends}`",
         f"- Prefill KV write backend: `{result['prefill_kv_write_backend']}`",
         f"- git commit: `{result['environment_after'].get('git_commit')}` "
         f"(dirty={result['environment_after'].get('git_dirty')})",

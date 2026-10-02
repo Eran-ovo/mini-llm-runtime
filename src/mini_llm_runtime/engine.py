@@ -43,6 +43,24 @@ class EngineStepResult:
     started_ns: int
     tokens_ready_ns: int
     completed_ns: int
+    prefill_attention_backend: str | None
+
+
+def select_prefill_attention_backend(
+    configured: str, lengths: Sequence[int]
+) -> str:
+    """根据本轮 prompt 形状选择 Attention；显式 backend 永远优先。"""
+    if configured not in {"auto", "masked", "segmented_sdpa"}:
+        raise ValueError("prefill_attention_backend 必须是 auto、masked 或 segmented_sdpa")
+    if configured != "auto":
+        return configured
+    if not lengths or any(length <= 0 for length in lengths):
+        raise ValueError("auto Prefill 需要非空且为正数的 prompt lengths")
+    # RTX 3060 上 4×64 几乎持平、4×128 开始有收益。
+    # 同时检查最长 prompt，避免很多极短请求触发大量 SDPA 调用。
+    if sum(lengths) >= 512 and max(lengths) >= 128:
+        return "segmented_sdpa"
+    return "masked"
 
 
 class ContinuousBatchEngine:
@@ -61,13 +79,15 @@ class ContinuousBatchEngine:
         clock_ns: Callable[[], int] = time.perf_counter_ns,
         metrics: RequestMetricsCollector | None = None,
         enable_nvtx: bool = False,
-        prefill_attention_backend: str = "masked",
+        prefill_attention_backend: str = "auto",
         prefill_kv_write_backend: str = "vectorized",
     ) -> None:
         if runner.decode_attention_backend != "paged_cuda":
             raise ValueError("ContinuousBatchEngine 需要 paged_cuda ModelRunner")
-        if prefill_attention_backend not in {"masked", "segmented_sdpa"}:
-            raise ValueError("prefill_attention_backend 必须是 masked 或 segmented_sdpa")
+        if prefill_attention_backend not in {"auto", "masked", "segmented_sdpa"}:
+            raise ValueError(
+                "prefill_attention_backend 必须是 auto、masked 或 segmented_sdpa"
+            )
         if prefill_kv_write_backend not in {"scalar", "vectorized"}:
             raise ValueError("prefill_kv_write_backend 必须是 scalar 或 vectorized")
         storage = admission.manager.storage
@@ -152,6 +172,7 @@ class ContinuousBatchEngine:
         # request_id -> GPU scalar token。最后按 batch.items 顺序一次性同步回 CPU。
         selected_tokens: dict[str, torch.Tensor] = {}
         prefill_ids = batch.prefill_request_ids
+        selected_prefill_backend: str | None = None
         try:
             self.metrics.require_registered(
                 tuple(item.request_id for item in batch.items)
@@ -160,10 +181,14 @@ class ContinuousBatchEngine:
                 item for item in batch.items if item.request_id in prefill_ids
             )
             if prefill_items:
+                prefill_lengths = tuple(len(item.input_token_ids) for item in prefill_items)
+                selected_prefill_backend = select_prefill_attention_backend(
+                    self.prefill_attention_backend, prefill_lengths
+                )
                 with _nvtx_range(
                     self.enable_nvtx,
                     f"model.prefill_batch:requests={len(prefill_items)}:"
-                    f"tokens={sum(len(item.input_token_ids) for item in prefill_items)}",
+                    f"tokens={sum(prefill_lengths)}:backend={selected_prefill_backend}",
                 ):
                     for item in prefill_items:
                         self.metrics.record_prefill_started(
@@ -183,13 +208,13 @@ class ContinuousBatchEngine:
                     adapter = PagedBatchPrefillAdapter(
                         self.manager,
                         prefill_ids,
-                        tuple(len(item.input_token_ids) for item in prefill_items),
+                        prefill_lengths,
                         write_backend=self.prefill_kv_write_backend,
                     )
                     output = self.runner.prefill_batch(
                         input_ids,
                         cache=adapter,
-                        attention_backend=self.prefill_attention_backend,
+                        attention_backend=selected_prefill_backend,
                     )
                     prefill_tokens = output.logits[:, -1].argmax(dim=-1)
                     for index, request_id in enumerate(prefill_ids):
@@ -249,4 +274,5 @@ class ContinuousBatchEngine:
             started_ns=started_ns,
             tokens_ready_ns=tokens_ready_ns,
             completed_ns=completed_ns,
+            prefill_attention_backend=selected_prefill_backend,
         )
