@@ -103,3 +103,19 @@ masked 为 26.46 ms（`auto` 选它）；4×256 token 的 masked/segmented 分�
 相对 L2 为 0.00668 且 greedy token 相同，逐请求 reference 与 packed KV 的最大
 相对 L2 为 0.01371，超过当前 0.01 门槛；因此没有正式 timing JSON，不能拿它
 调阈值。尚未确认这是 FP16 GEMM 形状舍入还是实现问题，不能为得到性能数字而放宽门槛。
+
+规则提交 `57ff869` 后又从 clean tree 复测三档；`auto` 选择、同写入 backend
+的 CUDA Event 中位数与显存峰值如下。每档 warmup 3、正式样本 10，所有
+logits/token/KV 门禁通过：
+
+| 形状 | auto 选择 | masked | segmented | segmented 相对变化 | masked / segmented 峰值显存 |
+|---|---|---:|---:|---:|---:|
+| 8×64 | segmented | 45.77 ms | 40.08 ms | -12.4% | 1000.01 / 985.13 MiB |
+| 16×32 | segmented | 45.84 ms | 43.49 ms | -5.1% | 1002.33 / 987.45 MiB |
+| 32×16 | masked | 45.14 ms | 47.54 ms | +5.3% | 1006.98 / 992.10 MiB |
+
+原始 JSON 位于本地 `benchmarks/results/v2_5_dispatch_*_clean_57ff869/`。
+16×32 的差距接近本机样本波动，应视为边界启发式而非稳定性能保证。
+真实 Qwen Engine 的 8×64 单步检查还验证了 `auto` 实际走 segmented，
+与显式 masked 的 8 个 greedy token 完全一致，且全部 KV block 释放；
+该单步检查不是正式性能 benchmark。

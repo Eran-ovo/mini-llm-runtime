@@ -20,6 +20,19 @@ Release bundle 不进入 Git；通过
 
 ## Formal Benchmark
 
+### v2.5 Ragged Packed Prefill Dispatch
+
+- shape-sweep source commit：`af3280d`；规则提交与 clean-tree 复测 commit：`57ff869`；
+- 正式复测路径：`benchmarks/results/v2_5_dispatch_{8x64,16x32,32x16}_clean_57ff869/`；
+- 每组 warmup 3、measured 10；比较 `masked + vectorized KV` 与
+  `segmented + vectorized KV`，记录原始 CUDA Event 样本、median、peak memory、
+  GPU/CUDA/PyTorch、Git commit 和 logits/token/KV 对拍；
+- `8×64` 切换到 segmented；`32×16` 保留 masked；`16×32` 差距接近波动，不承诺稳定收益；
+- `(128,128,128,1)` 的 KV 相对 L2 超过预设门槛，未进入计时；失败原因与原始
+  诊断值保留在 `docs/prefill_attention_backends.md`。
+
+这些只测 Prefill ModelRunner + KV 写入，不是端到端 TTFT。
+
 ### v2.4 Packed Prefill Attention Dispatch
 
 - source commit：`7f4c844`，GPU：RTX 3060 Laptop，模型：Qwen2.5-0.5B FP16；
