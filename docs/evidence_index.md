@@ -83,6 +83,17 @@ Release bundle 不进入 Git；通过
 
 ## Formal Correctness
 
+### Ragged Engine/Scheduler HF Gate
+
+- source commit：`80d9e40`；clean-tree 路径：
+  `benchmarks/results/engine_ragged_continuation_clean_80d9e40/result.json`；
+- workload：四请求 `(128,128,128,1)`，每条生成 3 token；第 0 步 packed
+  Prefill，第 1/2 步 batched Decode；完整 greedy token 序列与 HF 一致；
+- 区分已提交 Cache 长度与 admission 预留容量，验证逻辑 block 边界、
+  独占物理 block、完成后 28/28 block 回收以及 Scheduler 队列清空；
+- `244 passed`。不测时间，也不覆盖 mixed step 的晚到请求；详见
+  `docs/packed_prefill_correctness_gate.md`。
+
 ### Ragged Packed Prefill→Paged Decode HF Gate
 
 - source commit：`a75b400`；clean-tree 路径：

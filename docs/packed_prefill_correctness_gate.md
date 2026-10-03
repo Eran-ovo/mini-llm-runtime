@@ -83,3 +83,22 @@ Cache 长度从 `(128,128,128,1)` 经第一次 Decode 变为 `(129,129,129,2)`�
 这是固定 workload 的 correctness 证据，不是性能 benchmark；它未覆盖
 Scheduler 的动态加入/离开、长序列数值漂移或其他模型/GPU。相应单元和完整测试
 为 `236 passed, 1 warning`（CUDA 架构编译提示）。
+
+## Engine/Scheduler 路径的续写
+
+`scripts/check_engine_ragged_continuation.py` 把**同一** `(128,128,128,1)`
+workload 送入 `ContinuousBatchEngine`。第 0 步四请求 packed Prefill（`auto`
+选择 `masked`），第 1/2 步分别对四请求 batched Paged Decode。HF 仍独立显式
+Prefill/Decode；四条请求各 3 个 greedy token 全部一致。
+
+这里须区分“已提交长度”和“物理预留容量”：Admission 在第 0 步就为三条
+128-token 请求各预留 9 个 block，即容量 144，但已提交长度仍为 128；
+第 1 步长度增至 129，跨越**逻辑** block 边界，物理 block 数保持 9，
+不是此时新分配。第 2 步发出最后一个 token 后，Engine 释放 28/28 个 block，
+waiting/running 队列与 reservation 均为空。Gate 还逐步检查发出的 token、
+block table 的独占和稳定性、最终释放的 block IDs。
+
+clean-tree commit `80d9e40821c283e6ce299f04a70d930b2aa34dae` 的完整记录位于
+`benchmarks/results/engine_ragged_continuation_clean_80d9e40/result.json`；
+`244 passed, 1 warning`。这仍是固定 workload 的 correctness 检查，不测时间，
+也没有覆盖新请求在 Decode 过程中加入的 mixed step；该场景需要单独验证。
