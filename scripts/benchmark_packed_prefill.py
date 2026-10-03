@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import weakref
 from pathlib import Path
 
 import torch
@@ -317,53 +318,70 @@ def main() -> None:
             packed_input, cache=adapter, attention_backend="segmented_sdpa"
         ).logits[:, -1]
 
-    # 数值 oracle 和写入 oracle 分开：前者跨执行形状，后者只变 KV 写入。
-    serial_manager = prepare()
-    serial_logits = serial(serial_manager)
-    candidates = {"packed": packed}
-    if args.compare_segmented_sdpa:
-        candidates["segmented"] = segmented
-    if args.compare_vectorized_kv_write:
-        candidates["packed_vectorized"] = packed_vectorized
-    candidate_runs = {}
-    for name, operation in candidates.items():
-        manager = prepare()
-        candidate_runs[name] = (manager, operation(manager))
+    def verify_correctness() -> tuple[dict, list[weakref.ReferenceType]]:
+        """正确性 Cache 只在本作用域存活，计时前统一释放其 GPU storage。"""
+        # 数值 oracle 和写入 oracle 分开：前者跨执行形状，后者只变 KV 写入。
+        serial_manager = prepare()
+        serial_logits = serial(serial_manager)
+        candidates = {"packed": packed}
+        if args.compare_segmented_sdpa:
+            candidates["segmented"] = segmented
+        if args.compare_vectorized_kv_write:
+            candidates["packed_vectorized"] = packed_vectorized
+        candidate_runs = {}
+        for name, operation in candidates.items():
+            manager = prepare()
+            candidate_runs[name] = (manager, operation(manager))
 
-    model_numerics = {
-        name: compare_model_logits(serial_logits, logits)
-        for name, (_, logits) in candidate_runs.items()
-    }
-    kv_diagnostics = {
-        name: compare_kv_diagnostic(serial_manager, manager, request_ids)
-        for name, (manager, _) in candidate_runs.items()
-    }
-    storage_equivalence = {}
-    if args.compare_vectorized_kv_write:
-        scalar_manager, scalar_logits = candidate_runs["packed"]
-        vector_manager, vector_logits = candidate_runs["packed_vectorized"]
-        storage_equivalence["masked_scalar_vs_vectorized"] = compare_packed_storage_exact(
-            scalar_manager, vector_manager, request_ids, scalar_logits, vector_logits
-        )
-    if args.compare_segmented_sdpa:
-        segmented_scalar_manager = prepare()
-        segmented_scalar_logits = segmented_scalar(segmented_scalar_manager)
-        segmented_manager, segmented_logits = candidate_runs["segmented"]
-        storage_equivalence["segmented_scalar_vs_vectorized"] = (
-            compare_packed_storage_exact(
-                segmented_scalar_manager,
-                segmented_manager,
-                request_ids,
-                segmented_scalar_logits,
-                segmented_logits,
+        model_numerics = {
+            name: compare_model_logits(serial_logits, logits)
+            for name, (_, logits) in candidate_runs.items()
+        }
+        kv_diagnostics = {
+            name: compare_kv_diagnostic(serial_manager, manager, request_ids)
+            for name, (manager, _) in candidate_runs.items()
+        }
+        storage_equivalence = {}
+        if args.compare_vectorized_kv_write:
+            scalar_manager, scalar_logits = candidate_runs["packed"]
+            vector_manager, vector_logits = candidate_runs["packed_vectorized"]
+            storage_equivalence["masked_scalar_vs_vectorized"] = (
+                compare_packed_storage_exact(
+                    scalar_manager,
+                    vector_manager,
+                    request_ids,
+                    scalar_logits,
+                    vector_logits,
+                )
             )
+        if args.compare_segmented_sdpa:
+            segmented_scalar_manager = prepare()
+            segmented_scalar_logits = segmented_scalar(segmented_scalar_manager)
+            segmented_manager, segmented_logits = candidate_runs["segmented"]
+            storage_equivalence["segmented_scalar_vs_vectorized"] = (
+                compare_packed_storage_exact(
+                    segmented_scalar_manager,
+                    segmented_manager,
+                    request_ids,
+                    segmented_scalar_logits,
+                    segmented_logits,
+                )
+            )
+        correctness = build_layered_correctness(
+            model_numerics, storage_equivalence, kv_diagnostics
         )
-    correctness = build_layered_correctness(
-        model_numerics, storage_equivalence, kv_diagnostics
-    )
-    if not correctness["passed"]:
-        raise RuntimeError(f"正确性失败：{correctness}")
-    del serial_manager, candidate_runs
+        if not correctness["passed"]:
+            raise RuntimeError(f"正确性失败：{correctness}")
+        # 只把 weak reference 传出作用域，以便在计时前检查 Cache 已销毁。
+        managers = [serial_manager, *(item[0] for item in candidate_runs.values())]
+        if args.compare_segmented_sdpa:
+            managers.append(segmented_scalar_manager)
+        return correctness, [weakref.ref(item) for item in managers]
+
+    correctness, correctness_cache_refs = verify_correctness()
+    if any(item() is not None for item in correctness_cache_refs):
+        raise RuntimeError("正确性 KV Cache 在 benchmark 计时前仍存活")
+    del correctness_cache_refs
 
     cases = {
         "serial": CudaBenchmarkCase(operation=serial, prepare=prepare),
@@ -407,6 +425,7 @@ def main() -> None:
         "request_ids": list(request_ids),
         "block_size": args.block_size,
         "correctness": correctness,
+        "correctness_caches_released_before_timing": True,
         "cases": {name: timing.to_dict() for name, timing in results.items()},
         "environment_before": environment_before,
         "environment_after": environment_after,
