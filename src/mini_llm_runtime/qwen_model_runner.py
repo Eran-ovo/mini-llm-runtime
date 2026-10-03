@@ -455,7 +455,7 @@ class QwenPrefillRunner:
         """对多个变长请求各推进一个 token，并共享每层的一次 Paged Attention。
 
         `token_ids` 的第 i 行必须属于 `cache.request_ids[i]`。本入口只负责
-        Decode；每个请求仍需先用单请求 PagedRequestKVCache 完成 Prefill。
+        Decode；每个请求仍需先用单请求或 packed Prefill 填满自己的 Cache。
         """
         if self.decode_attention_backend != "paged_cuda":
             raise ValueError("decode_batch 只支持 paged_cuda backend")
