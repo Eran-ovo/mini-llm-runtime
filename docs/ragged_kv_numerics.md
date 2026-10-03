@@ -4,8 +4,9 @@
 
 在 Qwen2.5-0.5B、RTX 3060 Laptop、FP16、请求长度 `(128,128,128,1)` 下，
 packed Prefill 与四次逐请求 Prefill 的最终 greedy token 相同，但第 4 个请求的
-跨层 V Cache 相对 L2 为 `0.0137077`，超过 benchmark 原有的 `0.01` 门槛。
-该形状仍不能进入正式性能计时；本页是 correctness 诊断，不是 benchmark。
+跨层 V Cache 相对 L2 为 `0.0137077`，超过 benchmark 当时的 `0.01` 门槛。
+本页记录的是当时的 correctness 诊断，不是 benchmark。后续已用分层正确性门禁
+取代这一单一阈值；正式结果见 `docs/packed_prefill_correctness_gate.md`。
 
 `relative L2 = ||reference - actual||₂ / ||reference||₂`。它反映整个张量的相对
 偏差，但数值大小会受 reference 范数影响；单看百分比不能判断物理 block 写错了。
@@ -51,6 +52,7 @@ clean-tree commit `fafddb4` 的完整逐请求、逐层原始诊断位于本地
 包括环境与 Git commit。该目录默认不进 Git。诊断运行不使用 CUDA Event、
 warmup 或多轮计时，也不能被引用为性能结果。
 
-本次**不放宽 1% 门槛**。下一步应把 benchmark 的两种问题分开验证：
-物理 KV 写入是否逐元素正确，和不同 FP16 模型执行形状是否在明确的数值容差内。
-在新判据经过独立测试之前，`(128,128,128,1)` 继续被当前 benchmark 拦截。
+此诊断阶段**没有直接放宽 1% 门槛**。后续 commit `982bc03` 把跨执行形状的
+模型数值比较与同形状 KV 写入等价比较分开，并以独立单元测试验证；commit
+`1df7406` 修正了 correctness Cache 在计时前的释放问题。原 1% KV 项仍保留为
+诊断，不再作为拒绝该形状的单独理由。

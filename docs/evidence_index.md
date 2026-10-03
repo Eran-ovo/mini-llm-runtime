@@ -20,6 +20,18 @@ Release bundle 不进入 Git；通过
 
 ## Formal Benchmark
 
+### v2.7 Packed Prefill 分层正确性门禁
+
+- source commit：`1df7406`；路径：
+  `benchmarks/results/v2_7_layered_gate_ragged_clean_1df7406/` 与
+  `benchmarks/results/v2_7_layered_gate_4x64_clean_1df7406/`；
+- `(128,128,128,1)` 与 `(64,64,64,64)` 分别 warmup 3、measured 10/8；
+  JSON 记录 CUDA Event 原始样本、median、peak memory 和环境/commit；
+- schema v2 将跨形状 logits/token 数值门禁、同形状 scalar/vectorized 逻辑 KV
+  完全等价、跨形状 KV 诊断分开；对拍 Cache 释放后才开始计时；
+- commit `982bc03` 的同名旧 JSON 有 Cache 生命周期污染，**时间与显存不可引用**；
+  保留为失败实验。详见 `docs/packed_prefill_correctness_gate.md`。
+
 ### v2.5 Ragged Packed Prefill Dispatch
 
 - shape-sweep source commit：`af3280d`；规则提交与 clean-tree 复测 commit：`57ff869`；
