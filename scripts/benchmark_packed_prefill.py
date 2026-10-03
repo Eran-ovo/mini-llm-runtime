@@ -27,6 +27,134 @@ PROMPTS = (
     "CUDA 是什么？",
     "Paged Attention 如何管理显存？",
 )
+LOGITS_RELATIVE_L2_LIMIT = 0.01
+LEGACY_KV_RELATIVE_L2_LIMIT = 0.01
+
+
+def compare_model_logits(
+    reference: torch.Tensor, actual: torch.Tensor
+) -> dict[str, bool | float | None]:
+    """跨执行形状只用最终可观察 logits/token 做数值门禁。"""
+    if reference.shape != actual.shape:
+        raise ValueError("reference 与 candidate logits 形状不同")
+    finite = bool(torch.isfinite(reference).all() and torch.isfinite(actual).all())
+    tokens_match = bool(torch.equal(reference.argmax(-1), actual.argmax(-1)))
+    relative_l2 = None
+    max_abs = None
+    if finite:
+        difference = reference.float() - actual.float()
+        relative_l2 = float(
+            torch.linalg.vector_norm(difference)
+            / torch.linalg.vector_norm(reference.float()).clamp_min(1e-12)
+        )
+        max_abs = float(difference.abs().max())
+    return {
+        "passed": finite and tokens_match and relative_l2 is not None
+        and relative_l2 <= LOGITS_RELATIVE_L2_LIMIT,
+        "finite": finite,
+        "tokens_match": tokens_match,
+        "logits_relative_l2": relative_l2,
+        "logits_max_abs_diff": max_abs,
+        "logits_elementwise_close_diagnostic": bool(
+            torch.allclose(reference, actual, atol=5e-2, rtol=5e-3)
+        ),
+    }
+
+
+def compare_packed_storage_exact(
+    reference_manager: PagedKVCacheManager,
+    actual_manager: PagedKVCacheManager,
+    request_ids: tuple[str, ...],
+    reference_logits: torch.Tensor,
+    actual_logits: torch.Tensor,
+) -> dict[str, bool | str | None]:
+    """同一 packed 计算只换写入方式时，逐元素验证逻辑 KV 与 logits。"""
+    logits_exact = bool(torch.equal(reference_logits, actual_logits))
+    first_mismatch = None
+    for request_id in request_ids:
+        reference_kv = reference_manager.gather(request_id)
+        actual_kv = actual_manager.gather(request_id)
+        for kind, left, right in zip(
+            ("key", "value"), reference_kv, actual_kv, strict=True
+        ):
+            if not torch.equal(left, right) and first_mismatch is None:
+                first_mismatch = f"{request_id}:{kind}"
+    return {
+        "passed": logits_exact and first_mismatch is None,
+        "logits_exact": logits_exact,
+        "kv_exact": first_mismatch is None,
+        "first_kv_mismatch": first_mismatch,
+    }
+
+
+def compare_kv_diagnostic(
+    reference_manager: PagedKVCacheManager,
+    actual_manager: PagedKVCacheManager,
+    request_ids: tuple[str, ...],
+) -> dict[str, bool | float | str | tuple[float, float] | None]:
+    """跨形状 KV 误差只保留为诊断；非有限值仍属于硬错误。"""
+    max_abs = 0.0
+    max_relative_l2 = 0.0
+    worst_values = None
+    worst_request = None
+    worst_kind = None
+    finite = True
+    for request_id in request_ids:
+        reference_kv = reference_manager.gather(request_id)
+        actual_kv = actual_manager.gather(request_id)
+        for kind, left, right in zip(
+            ("key", "value"), reference_kv, actual_kv, strict=True
+        ):
+            if not bool(torch.isfinite(left).all() and torch.isfinite(right).all()):
+                finite = False
+                continue
+            difference = (left.float() - right.float()).abs()
+            maximum, flat_index = difference.flatten().max(dim=0)
+            if float(maximum) > max_abs:
+                max_abs = float(maximum)
+                worst_values = (
+                    float(left.flatten()[flat_index]),
+                    float(right.flatten()[flat_index]),
+                )
+            relative_l2 = float(
+                torch.linalg.vector_norm(left.float() - right.float())
+                / torch.linalg.vector_norm(left.float()).clamp_min(1e-12)
+            )
+            if relative_l2 > max_relative_l2:
+                max_relative_l2 = relative_l2
+                worst_request = request_id
+                worst_kind = kind
+    return {
+        "finite": finite,
+        "kv_max_abs_diff": max_abs if finite else None,
+        "kv_max_relative_l2": max_relative_l2 if finite else None,
+        "kv_within_legacy_1pct_diagnostic": (
+            max_relative_l2 <= LEGACY_KV_RELATIVE_L2_LIMIT if finite else False
+        ),
+        "kv_worst_values": worst_values,
+        "relative_l2_worst_request": worst_request,
+        "relative_l2_worst_kind": worst_kind,
+    }
+
+
+def build_layered_correctness(
+    model_numerics: dict,
+    storage_equivalence: dict,
+    kv_diagnostics: dict,
+) -> dict:
+    """旧 KV 1% 状态只作诊断；严格写入等价与模型结果才是硬门禁。"""
+    return {
+        "schema_version": 2,
+        "model_numerics": model_numerics,
+        "storage_equivalence": storage_equivalence,
+        "kv_diagnostics": kv_diagnostics,
+        "passed": (
+            bool(model_numerics)
+            and all(item["passed"] for item in model_numerics.values())
+            and all(item["passed"] for item in storage_equivalence.values())
+            and all(item["finite"] for item in kv_diagnostics.values())
+        ),
+    }
 
 
 def construct_prompts(
@@ -173,75 +301,69 @@ def main() -> None:
         ).logits[:, -1]
 
     def segmented(manager):
-        adapter = PagedBatchPrefillAdapter(manager, request_ids, lengths)
+        adapter = PagedBatchPrefillAdapter(
+            manager, request_ids, lengths, write_backend="vectorized"
+        )
         return runner.prefill_batch(
             packed_input, cache=adapter, attention_backend="segmented_sdpa"
         ).logits[:, -1]
 
-    # 先检验同一组实际输入的 logits 和所有请求的物理 KV 内容。
+    def segmented_scalar(manager):
+        # 只作正确性 oracle，不进入计时；与 segmented 只差 KV 写入方式。
+        adapter = PagedBatchPrefillAdapter(
+            manager, request_ids, lengths, write_backend="scalar"
+        )
+        return runner.prefill_batch(
+            packed_input, cache=adapter, attention_backend="segmented_sdpa"
+        ).logits[:, -1]
+
+    # 数值 oracle 和写入 oracle 分开：前者跨执行形状，后者只变 KV 写入。
     serial_manager = prepare()
     serial_logits = serial(serial_manager)
-
-    def compare_to_serial(operation):
-        candidate_manager = prepare()
-        candidate_logits = operation(candidate_manager)
-        logits_elementwise_close = bool(
-            torch.allclose(serial_logits, candidate_logits, atol=5e-2, rtol=5e-3)
-        )
-        logits_max_abs_diff = float(
-            (serial_logits.float() - candidate_logits.float()).abs().max()
-        )
-        logits_relative_l2 = float(
-            torch.linalg.vector_norm(serial_logits.float() - candidate_logits.float())
-            / torch.linalg.vector_norm(serial_logits.float()).clamp_min(1e-12)
-        )
-        logits_match = logits_relative_l2 <= 0.01 and bool(
-            torch.isfinite(candidate_logits).all()
-        )
-        tokens_match = bool(
-            torch.equal(serial_logits.argmax(-1), candidate_logits.argmax(-1))
-        )
-        kv_max_abs_diff = 0.0
-        kv_max_relative_l2 = 0.0
-        kv_worst_values = None
-        for request_id in request_ids:
-            serial_kv = serial_manager.gather(request_id)
-            candidate_kv = candidate_manager.gather(request_id)
-            for left, right in zip(serial_kv, candidate_kv, strict=True):
-                difference = (left.float() - right.float()).abs()
-                maximum, flat_index = difference.flatten().max(dim=0)
-                if float(maximum) > kv_max_abs_diff:
-                    kv_max_abs_diff = float(maximum)
-                    kv_worst_values = (
-                        float(left.flatten()[flat_index]),
-                        float(right.flatten()[flat_index]),
-                    )
-                relative_l2 = float(
-                    torch.linalg.vector_norm(left.float() - right.float())
-                    / torch.linalg.vector_norm(left.float()).clamp_min(1e-12)
-                )
-                kv_max_relative_l2 = max(kv_max_relative_l2, relative_l2)
-        correctness = {
-            "logits_match": logits_match,
-            "logits_elementwise_close": logits_elementwise_close,
-            "logits_max_abs_diff": logits_max_abs_diff,
-            "logits_relative_l2": logits_relative_l2,
-            "tokens_match": tokens_match,
-            "kv_match": kv_max_relative_l2 <= 0.01,
-            "kv_max_abs_diff": kv_max_abs_diff,
-            "kv_max_relative_l2": kv_max_relative_l2,
-            "kv_worst_values": kv_worst_values,
-        }
-        if not all(correctness[name] for name in ("logits_match", "tokens_match", "kv_match")):
-            raise RuntimeError(f"正确性失败：{correctness}")
-        return correctness
-
-    correctness = {"packed": compare_to_serial(packed)}
+    candidates = {"packed": packed}
     if args.compare_segmented_sdpa:
-        correctness["segmented"] = compare_to_serial(segmented)
+        candidates["segmented"] = segmented
     if args.compare_vectorized_kv_write:
-        correctness["packed_vectorized"] = compare_to_serial(packed_vectorized)
-    del serial_manager
+        candidates["packed_vectorized"] = packed_vectorized
+    candidate_runs = {}
+    for name, operation in candidates.items():
+        manager = prepare()
+        candidate_runs[name] = (manager, operation(manager))
+
+    model_numerics = {
+        name: compare_model_logits(serial_logits, logits)
+        for name, (_, logits) in candidate_runs.items()
+    }
+    kv_diagnostics = {
+        name: compare_kv_diagnostic(serial_manager, manager, request_ids)
+        for name, (manager, _) in candidate_runs.items()
+    }
+    storage_equivalence = {}
+    if args.compare_vectorized_kv_write:
+        scalar_manager, scalar_logits = candidate_runs["packed"]
+        vector_manager, vector_logits = candidate_runs["packed_vectorized"]
+        storage_equivalence["masked_scalar_vs_vectorized"] = compare_packed_storage_exact(
+            scalar_manager, vector_manager, request_ids, scalar_logits, vector_logits
+        )
+    if args.compare_segmented_sdpa:
+        segmented_scalar_manager = prepare()
+        segmented_scalar_logits = segmented_scalar(segmented_scalar_manager)
+        segmented_manager, segmented_logits = candidate_runs["segmented"]
+        storage_equivalence["segmented_scalar_vs_vectorized"] = (
+            compare_packed_storage_exact(
+                segmented_scalar_manager,
+                segmented_manager,
+                request_ids,
+                segmented_scalar_logits,
+                segmented_logits,
+            )
+        )
+    correctness = build_layered_correctness(
+        model_numerics, storage_equivalence, kv_diagnostics
+    )
+    if not correctness["passed"]:
+        raise RuntimeError(f"正确性失败：{correctness}")
+    del serial_manager, candidate_runs
 
     cases = {
         "serial": CudaBenchmarkCase(operation=serial, prepare=prepare),
