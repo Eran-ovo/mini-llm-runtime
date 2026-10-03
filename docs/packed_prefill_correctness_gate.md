@@ -22,7 +22,7 @@
 
 这个判据不是说 1% logits 阈值对任意模型都成立；它只是当前 Qwen2.5-0.5B
 FP16 工作负载的显式、可测试约定。它也不能单独证明 Cache 续写后的 Decode
-正确性，后续必须用 Prefill→Decode 的 HF 对拍补上。
+正确性；Prefill→Decode 的 HF 续写对拍已在 commit `a75b400` 补上，见下文。
 
 ## 计时生命周期
 
@@ -61,3 +61,25 @@ python scripts/benchmark_packed_prefill.py --local-files-only \
   --compare-vectorized-kv-write --warmup 3 --repeats 10 \
   --output-dir benchmarks/results/<new-run-name>
 ```
+
+## 变长 Prefill→Decode 续写
+
+`scripts/check_ragged_prefill_decode.py` 用相同的四条 tokenized prompt 构造
+`(128,128,128,1)`，先做 packed Prefill，再执行两轮 batched Paged Decode，
+每条请求共生成 3 个 token。HF reference 显式调用 Prefill 和带
+`past_key_values` 的 Decode，不调用 `generate()`。Gate 检查逐请求 token 序列、
+每轮输入位置与提交后 Cache 长度、活动物理 block 不重叠、跨 block 增长和
+最终释放全部 block。
+
+在 clean-tree commit `a75b400bb6a80d770766bae8e6d3745f580874bc` 上，
+`masked` 与 `segmented_sdpa` Prefill 均通过全部 8 项检查；四条请求的
+Cache 长度从 `(128,128,128,1)` 经第一次 Decode 变为 `(129,129,129,2)`，
+第二次变为 `(130,130,130,3)`。三条长请求第一次 Decode 从各 8 个 block
+增长到 9 个。完整 token IDs、block IDs、GPU/CUDA/PyTorch 和 Git 状态位于：
+
+- `benchmarks/results/ragged_prefill_decode_masked_clean_a75b400/result.json`
+- `benchmarks/results/ragged_prefill_decode_segmented_clean_a75b400/result.json`
+
+这是固定 workload 的 correctness 证据，不是性能 benchmark；它未覆盖
+Scheduler 的动态加入/离开、长序列数值漂移或其他模型/GPU。相应单元和完整测试
+为 `236 passed, 1 warning`（CUDA 架构编译提示）。

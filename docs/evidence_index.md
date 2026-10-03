@@ -83,6 +83,16 @@ Release bundle 不进入 Git；通过
 
 ## Formal Correctness
 
+### Ragged Packed Prefill→Paged Decode HF Gate
+
+- source commit：`a75b400`；clean-tree 路径：
+  `benchmarks/results/ragged_prefill_decode_{masked,segmented}_clean_a75b400/`；
+- workload：Qwen2.5-0.5B FP16，prompt 长度 `(128,128,128,1)`，每条生成 3 token；
+- HF 显式 Prefill/Decode，对拍完整 greedy token sequence；逐 step 验证独立
+  Cache 长度/位置、物理 block 唯一性、跨 block 增长和全部资源释放；
+- 两个 Prefill backend 均通过；`236 passed`。这不是性能 benchmark，不能引用
+  运行耗时。原理与限制见 `docs/packed_prefill_correctness_gate.md`。
+
 ### Continuous Batching HF Gate
 
 - release 路径：`release_candidate_e01c3c7/continuous_batch_correctness/`；
