@@ -29,7 +29,10 @@ Release bundle 不进入 Git；通过
   GPU/CUDA/PyTorch、Git commit 和 logits/token/KV 对拍；
 - `8×64` 切换到 segmented；`32×16` 保留 masked；`16×32` 差距接近波动，不承诺稳定收益；
 - `(128,128,128,1)` 的 KV 相对 L2 超过预设门槛，未进入计时；失败原因与原始
-  诊断值保留在 `docs/prefill_attention_backends.md`。
+  诊断值保留在 `docs/prefill_attention_backends.md`。后续在 clean-tree commit
+  `fafddb4` 上完成 FP16/FP32 逐层定位，详见 `docs/ragged_kv_numerics.md`；
+  原始正确性诊断位于 `benchmarks/results/v2_6_ragged_kv_fp{16,32}_clean_fafddb4/`，
+  不属于性能 benchmark。
 
 这些只测 Prefill ModelRunner + KV 写入，不是端到端 TTFT。
 

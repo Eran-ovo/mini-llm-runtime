@@ -102,7 +102,9 @@ masked 为 26.46 ms（`auto` 选它）；4×256 token 的 masked/segmented 分�
 失败实验：`(128,128,128,1)` 在计时前被 correctness gate 拦截。虽然 logits
 相对 L2 为 0.00668 且 greedy token 相同，逐请求 reference 与 packed KV 的最大
 相对 L2 为 0.01371，超过当前 0.01 门槛；因此没有正式 timing JSON，不能拿它
-调阈值。尚未确认这是 FP16 GEMM 形状舍入还是实现问题，不能为得到性能数字而放宽门槛。
+调阈值。后续逐层诊断确认：本形状下 scalar/vectorized 写入完全相同，差异首先
+出现在 FP16 packed 与逐请求的计算路径；详情见 `docs/ragged_kv_numerics.md`。
+即使原因已定位，也不能为得到性能数字而直接放宽门槛。
 
 规则提交 `57ff869` 后又从 clean tree 复测三档；`auto` 选择、同写入 backend
 的 CUDA Event 中位数与显存峰值如下。每档 warmup 3、正式样本 10，所有
