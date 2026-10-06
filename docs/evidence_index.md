@@ -83,6 +83,17 @@ Release bundle 不进入 Git；通过
 
 ## Formal Correctness
 
+### Ragged Engine Mixed-Step HF Gate
+
+- source commit：`bbf4635`；clean-tree 路径：
+  `benchmarks/results/engine_ragged_late_mixed_clean_bbf4635/result.json`；
+- 四请求 `(128,128,128,1)` 首轮 Prefill，随后晚到的 7-token 请求与旧请求
+  Decode 共处一个 mixed step，第三步五请求 batched Decode；
+- 五条 greedy token 序列与 HF 完全一致；逐 step 验证调度顺序、token 行归属、
+  逻辑 Cache 长度与预留容量、物理 block 独占、29/29 block 释放；
+- 原四请求模式在同一 commit 复测通过，完整测试 `249 passed`。这是
+  correctness case，不是性能 benchmark；详见 `docs/packed_prefill_correctness_gate.md`。
+
 ### Ragged Engine/Scheduler HF Gate
 
 - source commit：`80d9e40`；clean-tree 路径：

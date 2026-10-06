@@ -102,3 +102,24 @@ clean-tree commit `80d9e40821c283e6ce299f04a70d930b2aa34dae` 的完整记录位�
 `benchmarks/results/engine_ragged_continuation_clean_80d9e40/result.json`；
 `244 passed, 1 warning`。这仍是固定 workload 的 correctness 检查，不测时间，
 也没有覆盖新请求在 Decode 过程中加入的 mixed step；该场景需要单独验证。
+
+## 晚到短请求的 mixed step
+
+在 `scripts/check_engine_ragged_continuation.py --late-short-request` 模式中，
+第 0 步仍对 `(128,128,128,1)` 做四请求 packed Prefill；该步结束后才提交
+一条 7-token 短请求。第 1 步 Scheduler 先安排四条旧请求 Decode，再接纳新请求
+Prefill，合计 token budget `4+7=11`。Engine 实际先执行 Prefill、再执行
+Decode，但写回仍遵循 Scheduler 的请求顺序；第 2 步五条请求一起 Decode。
+
+独立 HF reference 对拍全部五条 greedy token 序列；Gate 同时检查每步发出的
+token 与请求行对应、已提交长度、预留容量、活动 block 独占与稳定、逻辑 block
+边界及最终释放。初始四请求预留 28 个 block，晚到请求另预留 1 个；结束后
+`29/29` 个 block 空闲。clean-tree commit
+`bbf46351f0fb6945c98e0f1d90158d101b9eb6c4` 的完整记录见
+`benchmarks/results/engine_ragged_late_mixed_clean_bbf4635/result.json`。
+旧四请求模式也在同一 commit 复测通过，见
+`benchmarks/results/engine_ragged_base_clean_bbf4635/result.json`；
+完整测试 `249 passed, 1 warning`。
+
+这只是一个人为控制到达时刻的 correctness case，不代表真实线上到达分布，
+没有测量 TTFT、TPOT 或吞吐量，也没有测试内存不足时的排队与抢占。
