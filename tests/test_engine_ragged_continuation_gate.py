@@ -1,6 +1,7 @@
 from copy import deepcopy
 
 from scripts.check_engine_ragged_continuation import (
+    evaluate_block_pressure_gate,
     evaluate_engine_gate,
     evaluate_late_arrival_gate,
 )
@@ -197,3 +198,105 @@ def test_late_gate_rejects_unreleased_late_block() -> None:
     gate = evaluate_late_arrival_gate(**case)
     assert not gate["passed"]
     assert not gate["checks"]["finished_blocks_released"]
+
+
+def valid_pressure_case() -> dict:
+    return {
+        "initial_ids": ("A", "B"),
+        "late_id": "C",
+        "prompt_lengths": {"A": 4, "B": 1, "C": 3},
+        "expected_tokens": {"A": (10, 11), "B": (20, 21, 22), "C": (30, 31)},
+        "actual_tokens": {"A": (10, 11), "B": (20, 21, 22), "C": (30, 31)},
+        "steps": [
+            {
+                "prefill": ("A", "B"), "decode": (), "batch_token_count": 5,
+                "prefill_attention_backend": "masked",
+                "emitted_tokens": (("A", 10), ("B", 20)),
+                "finished": (), "released_blocks": {},
+                "active_cache": {
+                    "A": {"token_count": 4, "token_capacity": 8, "block_ids": (0, 1)},
+                    "B": {"token_count": 1, "token_capacity": 4, "block_ids": (2,)},
+                },
+                "waiting_after_step": ("C",),
+                "reservations_after_step": ("A", "B"),
+                "free_blocks_after_step": 0,
+            },
+            {
+                "prefill": (), "decode": ("A", "B"), "batch_token_count": 2,
+                "prefill_attention_backend": None,
+                "emitted_tokens": (("A", 11), ("B", 21)),
+                "finished": ("A",), "released_blocks": {"A": (0, 1)},
+                "active_cache": {
+                    "B": {"token_count": 2, "token_capacity": 4, "block_ids": (2,)},
+                },
+                "waiting_after_step": ("C",),
+                "reservations_after_step": ("B",),
+                "free_blocks_after_step": 2,
+            },
+            {
+                "prefill": ("C",), "decode": ("B",), "batch_token_count": 4,
+                "prefill_attention_backend": "masked",
+                "emitted_tokens": (("B", 22), ("C", 30)),
+                "finished": ("B",), "released_blocks": {"B": (2,)},
+                "active_cache": {
+                    "C": {"token_count": 3, "token_capacity": 4, "block_ids": (0,)},
+                },
+                "waiting_after_step": (),
+                "reservations_after_step": ("C",),
+                "free_blocks_after_step": 2,
+            },
+            {
+                "prefill": (), "decode": ("C",), "batch_token_count": 1,
+                "prefill_attention_backend": None,
+                "emitted_tokens": (("C", 31),),
+                "finished": ("C",), "released_blocks": {"C": (0,)},
+                "active_cache": {}, "waiting_after_step": (),
+                "reservations_after_step": (), "free_blocks_after_step": 3,
+            },
+        ],
+        "block_size": 4,
+        "final_state": {
+            "waiting": (), "running": (), "finished": ("A", "B", "C"),
+            "active_cache_ids": (), "reservations": (),
+            "free_blocks": 3, "total_blocks": 3,
+        },
+    }
+
+
+def test_pressure_gate_accepts_wait_release_reuse() -> None:
+    gate = evaluate_block_pressure_gate(**valid_pressure_case())
+    assert gate["passed"]
+    assert all(gate["checks"].values())
+
+
+def test_pressure_gate_rejects_premature_admission() -> None:
+    case = deepcopy(valid_pressure_case())
+    case["steps"][1]["waiting_after_step"] = ()
+    case["steps"][1]["reservations_after_step"] = ("B", "C")
+    gate = evaluate_block_pressure_gate(**case)
+    assert not gate["passed"]
+    assert not gate["checks"]["resource_blocked_waits_without_cache"]
+
+
+def test_pressure_gate_rejects_nonreused_or_shared_block() -> None:
+    case = deepcopy(valid_pressure_case())
+    case["steps"][2]["active_cache"]["C"]["block_ids"] = (2,)
+    gate = evaluate_block_pressure_gate(**case)
+    assert not gate["passed"]
+    assert not gate["checks"]["reuses_released_physical_id"]
+
+
+def test_pressure_gate_rejects_wrong_token_after_reuse() -> None:
+    case = deepcopy(valid_pressure_case())
+    case["actual_tokens"]["C"] = (99, 31)
+    gate = evaluate_block_pressure_gate(**case)
+    assert not gate["passed"]
+    assert not gate["checks"]["tokens_match_hf"]
+
+
+def test_pressure_gate_rejects_missing_final_release() -> None:
+    case = deepcopy(valid_pressure_case())
+    case["steps"][3]["released_blocks"]["C"] = ()
+    gate = evaluate_block_pressure_gate(**case)
+    assert not gate["passed"]
+    assert not gate["checks"]["release_lifecycle"]

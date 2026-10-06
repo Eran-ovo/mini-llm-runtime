@@ -245,13 +245,166 @@ def evaluate_late_arrival_gate(
     return {"passed": all(checks.values()), "checks": checks}
 
 
+def evaluate_block_pressure_gate(
+    *,
+    initial_ids: tuple[str, ...],
+    late_id: str,
+    prompt_lengths: dict[str, int],
+    expected_tokens: dict[str, tuple[int, ...]],
+    actual_tokens: dict[str, tuple[int, ...]],
+    steps: list[dict],
+    block_size: int,
+    final_state: dict,
+) -> dict:
+    """资源满时等待；释放后才接纳，并验证物理 ID 可复用而 KV 不串位。"""
+    early_id = initial_ids[0]
+    survivors = initial_ids[1:]
+    all_ids = (*initial_ids, late_id)
+    expected_schedule = (
+        (initial_ids, (), initial_ids, sum(prompt_lengths[rid] for rid in initial_ids), "masked"),
+        ((), initial_ids, initial_ids, len(initial_ids), None),
+        ((late_id,), survivors, (*survivors, late_id), len(survivors) + prompt_lengths[late_id], "masked"),
+        ((), (late_id,), (late_id,), 1, None),
+    )
+    expected_emission_indices = (
+        {rid: 0 for rid in initial_ids},
+        {rid: 1 for rid in initial_ids},
+        {**{rid: 2 for rid in survivors}, late_id: 0},
+        {late_id: 1},
+    )
+    expected_live_lengths = (
+        {rid: prompt_lengths[rid] for rid in initial_ids},
+        {rid: prompt_lengths[rid] + 1 for rid in survivors},
+        {late_id: prompt_lengths[late_id]},
+        {},
+    )
+    expected_finished = ((), (early_id,), survivors, (late_id,))
+    expected_waiting = ((late_id,), (late_id,), (), ())
+    checks = {
+        "tokens_match_hf": expected_tokens == actual_tokens
+        and all(
+            len(actual_tokens.get(rid, ())) == (2 if rid in (early_id, late_id) else 3)
+            for rid in all_ids
+        ),
+        "resource_blocked_waits_without_cache": len(steps) == 4,
+        "released_blocks_enable_late_mixed_admission": len(steps) == 4,
+        "step_emissions_in_scheduler_order": len(steps) == 4,
+        "committed_lengths_and_reserved_capacity": True,
+        "live_physical_blocks_distinct": True,
+        "reuses_released_physical_id": False,
+        "release_lifecycle": len(steps) == 4,
+        "scheduler_and_cache_empty": (
+            not final_state["waiting"] and not final_state["running"]
+            and final_state["finished"] == all_ids
+            and not final_state["active_cache_ids"]
+            and not final_state["reservations"]
+            and final_state["free_blocks"] == final_state["total_blocks"]
+        ),
+    }
+    first_seen_blocks: dict[str, tuple[int, ...]] = {}
+    for index, step in enumerate(steps):
+        if index >= 4:
+            checks["release_lifecycle"] = False
+            continue
+        prefill, decode, order, token_count, backend = expected_schedule[index]
+        if (
+            step["prefill"] != prefill or step["decode"] != decode
+            or step["batch_token_count"] != token_count
+            or step["prefill_attention_backend"] != backend
+        ):
+            checks["released_blocks_enable_late_mixed_admission"] = False
+        indices = expected_emission_indices[index]
+        if any(len(actual_tokens.get(rid, ())) <= indices[rid] for rid in order):
+            checks["step_emissions_in_scheduler_order"] = False
+        elif step["emitted_tokens"] != tuple(
+            (rid, actual_tokens[rid][indices[rid]]) for rid in order
+        ):
+            checks["step_emissions_in_scheduler_order"] = False
+
+        active = step["active_cache"]
+        if set(active) != set(expected_live_lengths[index]):
+            checks["committed_lengths_and_reserved_capacity"] = False
+            checks["live_physical_blocks_distinct"] = False
+        live_blocks: list[int] = []
+        for rid, expected_length in expected_live_lengths[index].items():
+            if rid not in active:
+                continue
+            cache = active[rid]
+            max_new = 2 if rid in (early_id, late_id) else 3
+            expected_blocks = math.ceil(
+                (prompt_lengths[rid] + max_new - 1) / block_size
+            )
+            if (
+                cache["token_count"] != expected_length
+                or cache["token_capacity"] != expected_blocks * block_size
+                or len(cache["block_ids"]) != expected_blocks
+            ):
+                checks["committed_lengths_and_reserved_capacity"] = False
+            blocks = cache["block_ids"]
+            if rid in first_seen_blocks and first_seen_blocks[rid] != blocks:
+                checks["live_physical_blocks_distinct"] = False
+            first_seen_blocks.setdefault(rid, blocks)
+            live_blocks.extend(blocks)
+        if len(live_blocks) != len(set(live_blocks)):
+            checks["live_physical_blocks_distinct"] = False
+        if step["waiting_after_step"] != expected_waiting[index]:
+            checks["resource_blocked_waits_without_cache"] = False
+        if step["finished"] != expected_finished[index]:
+            checks["release_lifecycle"] = False
+
+    if len(steps) == 4:
+        first, blocked, admitted, final = steps
+        initial_blocks = {
+            block for rid in initial_ids for block in first["active_cache"][rid]["block_ids"]
+        }
+        released_early = set(blocked["released_blocks"].get(early_id, ()))
+        late_blocks = set(admitted["active_cache"].get(late_id, {}).get("block_ids", ()))
+        checks["resource_blocked_waits_without_cache"] &= (
+            first["free_blocks_after_step"] == 0
+            and blocked["free_blocks_after_step"] == len(released_early)
+            and late_id not in first["reservations_after_step"]
+            and late_id not in blocked["reservations_after_step"]
+            and late_id not in first["active_cache"]
+            and late_id not in blocked["active_cache"]
+        )
+        checks["released_blocks_enable_late_mixed_admission"] &= (
+            bool(released_early)
+            and admitted["prefill"] == (late_id,)
+            and late_id in admitted["reservations_after_step"]
+            and late_id not in admitted["waiting_after_step"]
+        )
+        checks["reuses_released_physical_id"] = (
+            bool(late_blocks)
+            and late_blocks <= released_early
+            and not (late_blocks & {
+                block for rid in survivors
+                for block in blocked["active_cache"][rid]["block_ids"]
+            })
+        )
+        checks["release_lifecycle"] &= (
+            not first["released_blocks"]
+            and blocked["released_blocks"] == {early_id: first_seen_blocks.get(early_id)}
+            and admitted["released_blocks"] == {
+                rid: first_seen_blocks.get(rid) for rid in survivors
+            }
+            and final["released_blocks"] == {late_id: first_seen_blocks.get(late_id)}
+            and initial_blocks == set(range(final_state["total_blocks"]))
+        )
+    return {"passed": all(checks.values()), "checks": checks}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--local-files-only", action="store_true")
-    parser.add_argument(
+    scenario = parser.add_mutually_exclusive_group()
+    scenario.add_argument(
         "--late-short-request", action="store_true",
         help="首轮 Prefill 后提交 7-token 请求，验证下一轮 mixed Prefill/Decode",
+    )
+    scenario.add_argument(
+        "--block-pressure-reuse", action="store_true",
+        help="限制 block pool 到 28，验证晚到请求等待旧请求释放后再复用",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
@@ -278,7 +431,8 @@ def main() -> None:
     initial_ids = tuple(f"request-{index}" for index in range(len(prompts)))
     late_id = "request-late"
     prompt_by_id = dict(zip(initial_ids, prompts, strict=True))
-    if args.late_short_request:
+    has_late_request = args.late_short_request or args.block_pressure_reuse
+    if has_late_request:
         late_template = tuple(
             tokenizer(LATE_PROMPT, add_special_tokens=True)["input_ids"]
         )
@@ -287,6 +441,19 @@ def main() -> None:
         )[:LATE_PROMPT_LENGTH]
     request_ids = tuple(prompt_by_id)
     prompt_lengths = {rid: len(prompt) for rid, prompt in prompt_by_id.items()}
+
+    def new_tokens_for(rid: str) -> int:
+        # 压力场景让第一条长请求提前结束，给等待队列创造一次真实的释放/复用。
+        if rid == late_id:
+            return LATE_NEW_TOKENS
+        if args.block_pressure_reuse and rid == initial_ids[0]:
+            return 2
+        return NEW_TOKENS
+
+    def blocks_for(rid: str) -> int:
+        return math.ceil(
+            (prompt_lengths[rid] + new_tokens_for(rid) - 1) / BLOCK_SIZE
+        )
 
     # HF reference 显式 Prefill/Decode；与 Runtime 分时加载，适配 6 GB GPU。
     hf_model = AutoModelForCausalLM.from_pretrained(
@@ -300,8 +467,7 @@ def main() -> None:
             token = output.logits[:, -1].argmax(dim=-1, keepdim=True)
             cache = output.past_key_values
             generated = [int(token.item())]
-            target_tokens = LATE_NEW_TOKENS if rid == late_id else NEW_TOKENS
-            for _ in range(target_tokens - 1):
+            for _ in range(new_tokens_for(rid) - 1):
                 output = hf_model(
                     input_ids=token, past_key_values=cache,
                     use_cache=True, return_dict=True,
@@ -316,12 +482,9 @@ def main() -> None:
 
     config, weights = load_qwen_checkpoint(model_dir, device="cuda", dtype=torch.float16)
     runner = QwenPrefillRunner(config, weights, decode_attention_backend="paged_cuda")
+    # 压力场景的池恰好只够首批请求；晚到请求必须等待一次释放。
     total_blocks = sum(
-        math.ceil(
-            (length + (LATE_NEW_TOKENS if rid == late_id else NEW_TOKENS) - 1)
-            / BLOCK_SIZE
-        )
-        for rid, length in prompt_lengths.items()
+        blocks_for(rid) for rid in (initial_ids if args.block_pressure_reuse else request_ids)
     )
     manager = PagedKVCacheManager(
         total_blocks=total_blocks,
@@ -347,7 +510,7 @@ def main() -> None:
     )
     for rid in initial_ids:
         prompt = prompt_by_id[rid]
-        engine.submit(rid, prompt, max_new_tokens=NEW_TOKENS)
+        engine.submit(rid, prompt, max_new_tokens=new_tokens_for(rid))
 
     steps = []
     while scheduler.has_unfinished_requests:
@@ -374,11 +537,17 @@ def main() -> None:
                 for rid in manager.request_ids
             },
         })
-        if args.late_short_request and len(steps) == 1:
+        if has_late_request and len(steps) == 1:
             # GPU step 边界到达：新请求必须由下一轮 Scheduler 接纳。
             engine.submit(
                 late_id, prompt_by_id[late_id], max_new_tokens=LATE_NEW_TOKENS
             )
+        steps[-1]["waiting_after_step"] = scheduler.waiting_request_ids
+        steps[-1]["running_after_step"] = scheduler.running_request_ids
+        steps[-1]["reservations_after_step"] = tuple(
+            item.request_id for item in admission.reservations
+        )
+        steps[-1]["free_blocks_after_step"] = manager.allocator.free_count
 
     actual_tokens = {
         rid: scheduler.get_request(rid).generated_token_ids for rid in request_ids
@@ -400,7 +569,18 @@ def main() -> None:
         and not final_state["reservations"]
         and final_state["free_blocks"] == final_state["total_blocks"]
     )
-    if args.late_short_request:
+    if args.block_pressure_reuse:
+        gate = evaluate_block_pressure_gate(
+            initial_ids=initial_ids,
+            late_id=late_id,
+            prompt_lengths=prompt_lengths,
+            expected_tokens=expected_tokens,
+            actual_tokens=actual_tokens,
+            steps=steps,
+            block_size=BLOCK_SIZE,
+            final_state=final_state,
+        )
+    elif args.late_short_request:
         gate = evaluate_late_arrival_gate(
             initial_ids=initial_ids,
             late_id=late_id,
@@ -423,22 +603,25 @@ def main() -> None:
             final_state=final_state,
         )
     result = {
-        "schema_version": 2 if args.late_short_request else 1,
+        "schema_version": 3 if args.block_pressure_reuse else 2 if args.late_short_request else 1,
         "artifact": (
-            "engine_ragged_mixed_step_correctness" if args.late_short_request
+            "engine_block_pressure_reuse_correctness" if args.block_pressure_reuse
+            else "engine_ragged_mixed_step_correctness" if args.late_short_request
             else "engine_ragged_prefill_decode_correctness"
         ),
-        "scenario": "late_short_request" if args.late_short_request else "initial_cohort",
+        "scenario": (
+            "block_pressure_reuse" if args.block_pressure_reuse
+            else "late_short_request" if args.late_short_request else "initial_cohort"
+        ),
         "reference": "HF eager explicit Prefill/Decode; no generate()",
         "model": args.model,
         "dtype": str(weights.embedding.dtype),
-        "prompt_lengths": prompt_lengths if args.late_short_request else PROMPT_LENGTHS,
+        "prompt_lengths": prompt_lengths if has_late_request else PROMPT_LENGTHS,
         "prompt_token_ids": prompt_by_id,
         "new_tokens": NEW_TOKENS,
-        "late_new_tokens": LATE_NEW_TOKENS if args.late_short_request else None,
+        "late_new_tokens": LATE_NEW_TOKENS if has_late_request else None,
         "max_new_tokens": {
-            rid: LATE_NEW_TOKENS if rid == late_id else NEW_TOKENS
-            for rid in request_ids
+            rid: new_tokens_for(rid) for rid in request_ids
         },
         "block_size": BLOCK_SIZE,
         "total_blocks": total_blocks,
