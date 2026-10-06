@@ -83,6 +83,16 @@ Release bundle 不进入 Git；通过
 
 ## Formal Correctness
 
+### Block Pressure Waiting / Reuse HF Gate
+
+- source commit：`d0d1c33`；clean-tree 路径：
+  `benchmarks/results/engine_block_pressure_reuse_clean_d0d1c33/result.json`；
+- 首批四请求占满 28 个 block；晚到请求保持 waiting 且无 Cache/reservation；
+  首条长请求结束释放 9 个 block 后，晚到请求在下一 mixed step 复用 block `0`；
+- 五条 greedy token 序列与 HF 一致，所有活动 block 独占，最终 28/28 归还；
+  同提交的原四请求与无压力晚到模式均复测通过，`254 passed`；
+- 固定场景 correctness，不是 TTFT/TPOT/吞吐 benchmark，也不证明一般公平性。
+
 ### Ragged Engine Mixed-Step HF Gate
 
 - source commit：`bbf4635`；clean-tree 路径：

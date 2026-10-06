@@ -122,4 +122,26 @@ token 与请求行对应、已提交长度、预留容量、活动 block 独占�
 完整测试 `249 passed, 1 warning`。
 
 这只是一个人为控制到达时刻的 correctness case，不代表真实线上到达分布，
-没有测量 TTFT、TPOT 或吞吐量，也没有测试内存不足时的排队与抢占。
+没有测量 TTFT、TPOT 或吞吐量；该模式本身不测试内存不足时的排队。
+下节单独补充资源压力排队，但仍不包括抢占。
+
+## Block pool 压力下的等待与复用
+
+`--block-pressure-reuse` 把物理池固定为恰好容纳首批四请求的 28 个 block。
+第 0 步 Prefill 后提交 7-token 晚到请求，池内 free=0；第 1 步旧请求继续
+Decode，晚到请求仍在 waiting，且没有 Cache 或 reservation。首条长请求
+只生成 2 token，于第 1 步结束并释放 block `0…8`；第 2 步晚到请求才
+与其余旧请求 Decode 同轮 Prefill，取得刚释放的 block `0`。其余请求
+结束后，第 3 步晚到请求 Decode 并释放 block，最终 free=28/28。
+
+Gate 检查等待期无副作用、每步 token 行与 HF 独立 reference 一致、活动
+block 无重叠、复用 ID 属于已释放集合、分阶段释放顺序和最终资源清空。
+干净提交 `d0d1c33c45ef9fbfcc01ae21b35883960e81686d` 的完整 token、
+block 与队列轨迹在
+`benchmarks/results/engine_block_pressure_reuse_clean_d0d1c33/result.json`。
+同一提交也复测了原四请求与无压力晚到模式；完整测试为
+`254 passed, 1 warning`。这里的“复用”只指物理 block ID，
+**不**允许新请求读到旧请求的 KV；HF token 对拍覆盖了当前固定输入的这一风险。
+
+此实验仍不测延迟，也不证明任意到达分布下不会饥饿；没有实现 preemption，
+更不能把“此处等待一步”写成通用调度保证。
