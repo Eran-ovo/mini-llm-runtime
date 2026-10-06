@@ -1,0 +1,56 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>02 项目地图 · mini-vLLM</title><link rel="stylesheet" href="assets/style.css"></head>
+<body data-page="02-project-map"><div class="layout"><main class="page"><article class="content">
+  <div class="crumb">Chapter 02 · Architecture</div><h1>先看地图，再进源码</h1><p class="lead">这个仓库不是一个巨型脚本。它把“选择谁运行”“执行模型”“管理显存”和“验证结论”刻意拆开。先知道每个目录、每个对象负责什么。</p>
+
+  <section class="chapter"><h2>1. 目录分别做什么</h2>
+    <div class="grid-3">
+      <div class="card"><span class="label">稳定代码</span><h3>src/mini_llm_runtime</h3><p>Engine、Scheduler、Qwen Runner、Cache、指标。真正被包导出的实现。</p></div>
+      <div class="card"><span class="label">GPU</span><h3>csrc/</h3><p>C++ binding、Paged Attention v1、split-KV 实验 kernel。</p></div>
+      <div class="card"><span class="label">学习</span><h3>experiments/</h3><p>逐层对拍与真实模型 walkthrough。用于理解，不等于稳定 API。</p></div>
+      <div class="card"><span class="label">验证</span><h3>tests/</h3><p>快速、确定性的状态机、shape、地址和回滚测试。</p></div>
+      <div class="card"><span class="label">运行</span><h3>scripts/</h3><p>benchmark、环境检查、容量分析、release evaluation。</p></div>
+      <div class="card"><span class="label">证据</span><h3>docs/ + milestones/</h3><p>设计记录、性能边界、验收白名单与失败实验。</p></div>
+    </div>
+  </section>
+
+  <section class="chapter"><h2>2. 四个核心角色 + 一个编排者</h2>
+    <div class="stack">
+      <div class="stack-row"><strong>RequestState</strong>保存 prompt IDs、生成上限、状态、已生成 token；不持有 GPU K/V。</div>
+      <div class="stack-row"><strong>RequestScheduler</strong>维护 waiting/running/finished，决定本 step 做哪些 Prefill/Decode。</div>
+      <div class="stack-row"><strong>QwenPrefillRunner</strong>只做模型数学：Embedding → 24 层 Decoder → LM Head。</div>
+      <div class="stack-row"><strong>PagedKVCacheManager</strong>拥有物理 block pool、GPU K/V tensors 和 request block tables。</div>
+      <div class="stack-row"><strong>ContinuousBatchEngine</strong>把上面三个组件按安全顺序串起来，转换 ID/tensor、同步 token、回滚和释放。</div>
+    </div>
+    <div class="diagram"><div class="flow"><div class="node blue"><strong>Scheduler</strong><small>算谁</small></div><div class="arrow">→</div><div class="node green"><strong>Engine</strong><small>怎么串</small></div><div class="arrow">→</div><div class="node orange"><strong>ModelRunner</strong><small>怎么算</small></div><div class="arrow">↔</div><div class="node"><strong>KV Manager</strong><small>历史放哪</small></div></div></div>
+  </section>
+
+  <section class="chapter"><h2>3. 一条完整请求的数据流</h2>
+    <div class="steps">
+      <div class="step"><div><b>engine.submit()</b><p>登记到达时间，并把 token IDs 交给 Scheduler，状态为 WAITING。</p></div></div>
+      <div class="step"><div><b>scheduler.schedule_step()</b><p>先给已有 running 请求安排 Decode，再用剩余 token/slot 接纳 whole Prefill。</p></div></div>
+      <div class="step"><div><b>admission.try_admit()</b><p>为新请求创建 block table，并保守预留整个生命周期的 blocks。</p></div></div>
+      <div class="step"><div><b>runner.prefill() / decode_batch()</b><p>执行 Qwen，逐层写 K/V；argmax 在 GPU 上选 token。</p></div></div>
+      <div class="step"><div><b>一次 GPU→CPU 同步</b><p>所有请求 token 按 Scheduler 原顺序拼接，一次性回到 CPU。</p></div></div>
+      <div class="step"><div><b>apply + release</b><p>更新请求状态；EOS/达到上限的请求释放全部 blocks。</p></div></div>
+    </div>
+  </section>
+
+  <section class="chapter"><h2>4. 为什么项目按 v0.1 → v1.0 演进</h2>
+    <table class="compare-table"><thead><tr><th>阶段</th><th>只解决一个问题</th><th>避免混入的错误</th></tr></thead><tbody>
+      <tr><td>v0.1</td><td>HF 显式 Prefill/Decode oracle</td><td>先确定“正确输出是什么”</td></tr>
+      <tr><td>v0.2</td><td>独立权重加载与 ModelRunner</td><td>隔离模型公式/权重映射</td></tr>
+      <tr><td>v0.3</td><td>连续 KV Cache</td><td>先验证历史不重算与事务</td></tr>
+      <tr><td>v0.4</td><td>Paged 地址管理</td><td>隔离逻辑/物理映射</td></tr>
+      <tr><td>v0.5</td><td>CUDA Paged Attention</td><td>最后才引入 kernel 地址与数值问题</td></tr>
+      <tr><td>v0.6</td><td>Scheduler + Engine</td><td>在单请求正确后引入多请求状态</td></tr>
+      <tr><td>v1.0</td><td>clean-tree release evidence</td><td>保证结果与代码版本可追溯</td></tr>
+    </tbody></table>
+    <div class="callout"><div class="icon">i</div><p>这是学习这个项目最重要的方法论：不要同时改模型数学、Cache 布局和 CUDA kernel。每次只改变一个变量，并与上一层 reference 对拍。</p></div>
+  </section>
+
+  <section class="chapter"><h2>5. 当前明确边界</h2>
+    <div class="grid-2"><div class="card"><h3>已经有</h3><ul class="checklist"><li>Qwen2.5-0.5B FP16 greedy</li><li>Paged KV + CUDA Attention</li><li>多请求 batched Decode</li><li>同步 Continuous Engine</li><li>Static/Continuous 对照</li><li>请求级指标与 release gate</li></ul></div><div class="card"><h3>没有</h3><ul><li>Web API / OpenAI compatible server</li><li>异步 CPU/GPU overlap</li><li>Chunked Prefill / preemption</li><li>采样、量化、分布式</li><li>Speculative Decoding</li></ul></div></div>
+    <a class="source-link" href="../../README.md">README.md</a><a class="source-link" href="../architecture.md">architecture.md</a><a class="source-link" href="../../src/mini_llm_runtime/engine.py">engine.py</a>
+  </section>
+  <div class="pager"><a href="01-foundations.html"><small>上一页</small>← 01 · 零基础概念</a><a href="03-model-loading.html"><small>下一页</small>03 · 配置与权重加载 →</a></div>
+</article></main></div><script src="assets/app.js"></script></body></html>

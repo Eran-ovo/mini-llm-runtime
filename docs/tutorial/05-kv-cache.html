@@ -1,0 +1,70 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>05 KV Cache · mini-vLLM</title><link rel="stylesheet" href="assets/style.css"></head>
+<body data-page="05-kv-cache"><div class="layout"><main class="page"><article class="content">
+  <div class="crumb">Chapter 05 · KV Cache</div><h1>为什么要缓存 K/V，以及怎样安全地写</h1><p class="lead">KV Cache 是推理引擎最核心的状态。它让 Decode 不再反复计算历史 token，但也引入容量、生命周期和失败一致性问题。</p>
+
+  <section class="chapter"><h2>1. 没有 Cache 会重复多少工作</h2>
+    <div class="example"><div class="example-title">prompt=[A,B,C]，准备生成 D、E、F</div>
+      <table class="compare-table"><thead><tr><th>步骤</th><th>无 Cache</th><th>有 Cache</th></tr></thead><tbody><tr><td>生成 D</td><td>计算 A B C</td><td>Prefill A B C</td></tr><tr><td>生成 E</td><td>重新计算 A B C D</td><td>只计算 D，读取缓存 A B C</td></tr><tr><td>生成 F</td><td>重新计算 A B C D E</td><td>只计算 E，读取缓存 A B C D</td></tr></tbody></table>
+    </div>
+    <p>历史 token 的 hidden state 会随层变化，但在自回归 causal attention 中，历史 token 对应的 K/V 不会因后续 token 到来而改变。因此可以逐层保存。</p>
+  </section>
+
+  <section class="chapter"><h2>2. 连续 KV Cache 的物理布局</h2>
+    <div class="formula">key/value shape = [layer, batch, kv_head, capacity, head_dim]</div>
+    <table class="shape-table"><thead><tr><th>维度</th><th>含义</th></tr></thead><tbody><tr><td>layer</td><td>每个 Decoder layer 有自己的 K/V</td></tr><tr><td>batch</td><td>当前固定 batch 的请求行</td></tr><tr><td>kv_head</td><td>GQA 的 K/V head</td></tr><tr><td>capacity</td><td>预分配的最大 token 数</td></tr><tr><td>head_dim</td><td>每个 head 的向量宽度</td></tr></tbody></table>
+    <p>项目同时分配 key 和 value 两个 tensor，所以字节数：</p>
+    <div class="formula">storage_bytes = 2 × L × B × Hkv × capacity × D × bytes_per_element</div>
+    <div class="callout"><div class="icon">i</div><p>Q 不需要持久化。未来 Decode 只需要“当前 token 的 Q”去查询“所有历史 K/V”；历史 Q 不会再次使用。</p></div>
+  </section>
+
+  <section class="chapter"><h2>3. 为什么不能写一层就增加 length</h2>
+    <p>一个 token 要在所有层产生 K/V。假设写到第 17 层异常：如果全局 <code>length</code> 已经加 1，读取者会认为 24 层都拥有这个 token，但后 7 层仍是未初始化内存。</p>
+    <div class="diagram"><div class="flow"><div class="node blue"><strong>begin_append(1)</strong><small>length 不变</small></div><div class="arrow">→</div><div class="node orange"><strong>write_layer 0…23</strong><small>写 pending 区间</small></div><div class="arrow">→</div><div class="node green"><strong>commit_append()</strong><small>length + 1</small></div></div></div>
+    <h3>事务的三个动作</h3>
+    <div class="grid-3"><div class="card"><h4>begin</h4><p>验证容量，创建 <code>PendingAppend(start,end)</code>，但不修改 length。</p></div><div class="card"><h4>write</h4><p>逐层写 <code>[B,Hkv,Snew,D]</code>，用 bool 数组记录哪些层已写。</p></div><div class="card"><h4>commit / abort</h4><p>全部层完成才推进 length；失败则丢弃可见性，旧字节以后覆盖。</p></div></div>
+  </section>
+
+  <section class="chapter"><h2>4. 对照源码看事务</h2>
+    <pre><code>def begin_append(self, token_count):
+    end = self.length + token_count
+    if end > self.capacity:
+        raise RuntimeError("容量不足")
+    self._pending = PendingAppend(self.length, end)
+    self._written_layers = [False] * self.num_layers
+
+def write_layer(self, layer_index, key, value):
+    pending = self._require_pending()
+    token_slice = slice(pending.start, pending.end)
+    self.key[layer_index, :, :, token_slice, :].copy_(key)
+    self.value[layer_index, :, :, token_slice, :].copy_(value)
+    self._written_layers[layer_index] = True
+
+def commit_append(self):
+    if any(layer_not_written):
+        raise RuntimeError("不能 commit")
+    self.length = self.pending.end
+    self._pending = None</code></pre>
+    <div class="example"><div class="example-title">具体数字</div><p>当前 <code>length=5</code>，调用 <code>begin_append(2)</code> 后 pending 是 <code>[5,7)</code>。第 0 层写入 token slots 5 和 6，但普通 <code>view_layer()</code> 仍只返回 <code>[:5]</code>。只有写完全部层并 commit 后，length 才变成 7。</p></div>
+  </section>
+
+  <section class="chapter"><h2>5. ModelRunner 如何使用这个接口</h2>
+    <pre><code>cache.begin_append(sequence)
+try:
+    for layer_index, layer in enumerate(weights.layers):
+        x = _decoder_layer(..., cache=cache, layer_index=layer_index)
+        # _attention 内部调用 cache.write_layer(layer_index, K, V)
+    cache.commit_append()
+except Exception:
+    if cache.pending is not None:
+        cache.abort_append()
+    raise</code></pre>
+    <p>Runner 只依赖 <code>LayerKVCache</code> Protocol，而不绑定具体实现。这使相同的模型代码既能接连续 Cache，也能接 Paged Cache adapter。</p>
+  </section>
+
+  <section class="chapter"><h2>6. 容量为什么是 prompt + new − 1</h2>
+    <div class="example"><div class="example-title">prompt 长 4，max_new_tokens=3</div><p>Prefill 写 4 个 token，并输出第 1 个新 token。为了输出第 2 个 token，要 Decode 第 1 个新 token（Cache 变 5）；为了输出第 3 个，要 Decode 第 2 个（Cache 变 6）。第 3 个输出后停止，不再写入。因此所需容量是 <code>4+3−1=6</code>。</p></div>
+    <details class="quiz"><summary>检查：abort 时为什么不用把已写字节清零？</summary><div class="answer">正确性依赖逻辑 length，而不是显存内容是否为零。abort 后这些位置不可见；下一次写同一区间会覆盖旧字节。清零只会增加无意义的显存带宽。</div></details>
+    <a class="source-link" href="../../src/mini_llm_runtime/kv_cache.py">kv_cache.py</a><a class="source-link" href="../../src/mini_llm_runtime/generation.py">generation.py</a><a class="source-link" href="../../tests/test_kv_cache.py">test_kv_cache.py</a>
+  </section>
+  <div class="pager"><a href="04-qwen-forward.html"><small>上一页</small>← 04 · Qwen 前向计算</a><a href="06-paged-kv.html"><small>下一页</small>06 · Paged KV Cache →</a></div>
+</article></main></div><script src="assets/app.js"></script></body></html>

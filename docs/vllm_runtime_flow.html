@@ -204,6 +204,59 @@
     .invariant b { display: block; margin-bottom: 8px; }
     .invariant p { margin: 0; color: var(--muted); font-size: 13px; }
 
+    /* Project atlas / deep dives */
+    .atlas { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .atlas-card { border: 1px solid var(--line); border-radius: 16px; background: #fff; padding: 18px; }
+    .atlas-card .folder { color: var(--orange); font: 800 12px/1 var(--mono); }
+    .atlas-card h3 { margin: 12px 0 8px; font-size: 19px; }
+    .atlas-card p { margin: 0; color: var(--muted); font-size: 13px; }
+    .atlas-card ul { margin: 12px 0 0; padding-left: 17px; color: var(--muted); font-size: 12px; }
+    .milestones { display: grid; grid-template-columns: repeat(7, 1fr); gap: 7px; margin-top: 18px; }
+    .milestone { position: relative; min-height: 126px; border: 1px solid var(--line); border-radius: 13px; background: #fff; padding: 13px; }
+    .milestone::before { content: ""; position: absolute; top: -5px; left: 13px; width: 22px; height: 4px; border-radius: 99px; background: var(--green); }
+    .milestone b { display: block; color: var(--green); font: 800 12px/1 var(--mono); margin-bottom: 10px; }
+    .milestone span { font-size: 12px; color: var(--muted); line-height: 1.4; }
+    .sequence { display: grid; gap: 0; counter-reset: sequence; }
+    .sequence-row { display: grid; grid-template-columns: 145px 48px 1fr; min-height: 76px; align-items: stretch; }
+    .sequence-who { padding: 17px 10px; text-align: right; font: 750 12px/1.35 var(--mono); color: var(--green); }
+    .sequence-line { position: relative; display: grid; place-items: start center; }
+    .sequence-line::before { content: ""; position: absolute; top: 0; bottom: 0; width: 2px; background: var(--line); }
+    .sequence-line::after { counter-increment: sequence; content: counter(sequence); z-index: 1; display: grid; place-items: center; width: 29px; height: 29px; margin-top: 13px; border-radius: 50%; color: white; background: var(--green); font: 800 11px/1 var(--mono); }
+    .sequence-row:last-child .sequence-line::before { bottom: 47px; }
+    .sequence-action { margin: 6px 0; padding: 12px 15px; border: 1px solid var(--line); border-radius: 11px; background: #fff; }
+    .sequence-action strong { font-size: 14px; }
+    .sequence-action p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+    .code-block { overflow-x: auto; white-space: pre; border-radius: 13px; background: #16211f; color: #d9eee7; padding: 17px; font: 12px/1.7 var(--mono); }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .algo { display: grid; gap: 8px; }
+    .algo-step { display: grid; grid-template-columns: 34px 1fr; gap: 11px; align-items: start; padding: 12px; border: 1px solid var(--line); background: #fff; border-radius: 11px; }
+    .algo-step i { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 8px; background: var(--orange-soft); color: var(--orange); font: 800 11px/1 var(--mono); font-style: normal; }
+    .algo-step b { display: block; font-size: 14px; }
+    .algo-step span { display: block; color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .formula-large { border-radius: 13px; background: var(--blue-soft); color: #1d566d; padding: 18px; font: 13px/1.8 var(--mono); }
+    .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .metric-card { border: 1px solid var(--line); border-radius: 14px; background: #fff; padding: 17px; }
+    .metric-card small { color: var(--muted); font: 700 10px/1 var(--mono); }
+    .metric-card strong { display: block; margin: 7px 0 2px; font-size: 26px; letter-spacing: -.03em; }
+    .metric-card span { color: var(--muted); font-size: 11px; }
+    .metric-card.highlight { color: white; background: var(--green); border-color: var(--green); }
+    .metric-card.highlight small, .metric-card.highlight span { color: #cce2db; }
+    .metric-track { display: grid; grid-template-columns: 1.1fr 1fr .9fr 1.4fr .8fr; margin: 22px 0 8px; }
+    .metric-segment { position: relative; min-height: 70px; padding: 11px; border-right: 2px solid var(--paper); background: #e9e8e0; font-size: 11px; }
+    .metric-segment:first-child { border-radius: 10px 0 0 10px; }
+    .metric-segment:last-child { border-radius: 0 10px 10px 0; }
+    .metric-segment.token { background: var(--green-soft); }
+    .metric-segment.cleanup { background: var(--orange-soft); }
+    .metric-segment b { display: block; margin-bottom: 4px; }
+    .metric-segment code { color: var(--muted); font-size: 10px; }
+    .evidence { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; }
+    .evidence-card { min-height: 160px; border: 1px solid var(--line); border-radius: 15px; padding: 17px; background: #fff; }
+    .evidence-card .level { color: var(--orange); font: 800 10px/1 var(--mono); }
+    .evidence-card h4 { margin: 11px 0 7px; }
+    .evidence-card p { margin: 0; color: var(--muted); font-size: 12px; }
+    .limits { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .limit { border-left: 3px solid var(--red); background: #f5e4df; border-radius: 0 11px 11px 0; padding: 12px 14px; font-size: 13px; color: #74443e; }
+
     footer { padding: 44px 0 70px; color: var(--muted); font-size: 13px; }
     footer .shell { padding-top: 22px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 20px; }
 
@@ -214,7 +267,10 @@
       .path { grid-template-columns: 1fr; }
       .path-arrow { transform: rotate(90deg); }
       .layer-flow { grid-template-columns: 1fr 1fr; }
-      .invariants { grid-template-columns: 1fr 1fr; }
+      .invariants, .atlas, .evidence { grid-template-columns: 1fr 1fr; }
+      .milestones { grid-template-columns: repeat(4, 1fr); }
+      .split { grid-template-columns: 1fr; }
+      .metric-grid { grid-template-columns: 1fr 1fr; }
       .step-list { grid-template-columns: 1fr 1fr; }
       .step-detail { min-height: 390px; }
     }
@@ -223,7 +279,12 @@
       .hero { padding-top: 50px; }
       .topbar .shell { min-height: 52px; }
       .nav { display: none; }
-      .step-list, .io-grid, .layer-flow, .invariants { grid-template-columns: 1fr; }
+      .step-list, .io-grid, .layer-flow, .invariants, .atlas, .evidence, .limits { grid-template-columns: 1fr; }
+      .milestones, .metric-grid { grid-template-columns: 1fr; }
+      .sequence-row { grid-template-columns: 88px 38px 1fr; }
+      .sequence-who { font-size: 10px; }
+      .metric-track { grid-template-columns: 1fr; }
+      .metric-segment { border-right: 0; border-bottom: 2px solid var(--paper); border-radius: 0 !important; }
       .panel { padding: 17px; }
       .step-detail::after { font-size: 110px; }
       .shape-row { grid-template-columns: 1fr; gap: 4px; }
@@ -238,8 +299,8 @@
     <div class="shell">
       <div class="brand">mini·<i>vLLM</i> runtime</div>
       <nav class="nav" aria-label="页面导航">
-        <a href="#overview">总览</a><a href="#lifecycle">生命周期</a><a href="#compute">计算路径</a>
-        <a href="#cache">Paged KV</a><a href="#batching">连续批处理</a><a href="#code-map">代码地图</a>
+        <a href="#overview">总览</a><a href="#project">项目地图</a><a href="#lifecycle">生命周期</a><a href="#compute">计算路径</a>
+        <a href="#cache">Paged KV</a><a href="#kernel">CUDA</a><a href="#batching">调度</a><a href="#engine">Engine</a><a href="#evidence">验证</a><a href="#code-map">源码</a>
       </nav>
     </div>
   </header>
@@ -251,21 +312,22 @@
       <p class="hero-copy">从 token 进入等待队列，到 Scheduler 组批、Qwen Decoder 计算、Paged KV Cache 间接寻址，再到生成 token 与回收显存——这是一份严格对应当前仓库代码的全流程地图。</p>
       <div class="hero-meta">
         <span class="pill"><span class="dot"></span>Qwen2.5-0.5B · 单 GPU</span>
-        <span class="pill"><span class="dot"></span>release evidence · <code>e01c3c7</code></span>
-        <span class="pill"><span class="dot orange"></span>v1.0 · RC 收尾</span>
+        <span class="pill"><span class="dot"></span>v1.0.0 发布提交 · <code>d31ded2</code></span>
+        <span class="pill"><span class="dot"></span>v1.1.0 · 当前源码</span>
       </div>
       <div class="headline-grid">
         <div class="summary">
           <strong>一句话理解</strong>
-          <p>Scheduler 决定“这一轮算谁”，ModelRunner 决定“怎么算”，PagedKVCacheManager 决定“历史 K/V 放哪里”；Decode 时 CUDA Paged Attention 通过 block table 直接读取离散物理块，避免把历史 Cache 拼成连续 tensor。</p>
+          <p>Engine 负责串起整条链路：Scheduler 决定“这一轮算谁”，ModelRunner 决定“怎么算”，PagedKVCacheManager 决定“历史 K/V 放哪里”；Decode 时 CUDA Paged Attention 通过 block table 直接读取离散物理块。</p>
         </div>
         <div class="status-card">
           <div class="head">当前真实边界</div>
           <ul class="status-list">
-            <li><span class="check">✓</span><span>单请求 Prefill / 多 token Decode 闭环</span></li>
+            <li><span class="check">✓</span><span>ContinuousBatchEngine 真实 GPU 闭环</span></li>
             <li><span class="check">✓</span><span>多请求 batched Paged Decode</span></li>
-            <li><span class="check">✓</span><span>Scheduler + block-aware admission</span></li>
-            <li><span class="check">✓</span><span>同步 ContinuousBatchEngine 已串通完整生命周期</span></li>
+            <li><span class="check">✓</span><span>Static / Continuous 正式对照</span></li>
+            <li><span class="check">✓</span><span>180 tests + clean-tree release bundle</span></li>
+            <li><span class="progress">◇</span><span>同步、greedy、单 GPU 教学 runtime</span></li>
           </ul>
         </div>
       </div>
@@ -300,10 +362,41 @@
       </div>
     </section>
 
+    <section id="project">
+      <div class="shell">
+        <div class="section-head">
+          <div><div class="kicker">02 · Project Atlas</div><h2>项目不是一条脚本</h2></div>
+          <p class="section-intro">它同时包含稳定 runtime、教学实验、正确性测试、性能脚本和证据文档。先分清这些目录，才能知道某段代码是在定义产品路径、验证数学，还是探索优化。</p>
+        </div>
+        <div class="atlas">
+          <div class="atlas-card"><div class="folder">src/mini_llm_runtime/</div><h3>稳定实现</h3><p>Engine、Scheduler、ModelRunner、KV Cache、CUDA Python 入口与指标采集。页面后续的主链路以这里为准。</p><ul><li>engine.py：编排</li><li>qwen_model_runner.py：模型计算</li><li>paged_kv_*.py：存储与地址</li></ul></div>
+          <div class="atlas-card"><div class="folder">csrc/</div><h3>CUDA 执行层</h3><p>PyTorch C++ binding、Paged Attention v1 和 split-KV 实验 kernel。首次调用通过 JIT extension 编译。</p><ul><li>FP16 / head_dim=64</li><li>GQA/MQA</li><li>FP32 online softmax</li></ul></div>
+          <div class="atlas-card"><div class="folder">experiments/</div><h3>逐层学习与对拍</h3><p>从手写 Attention、单层 Decoder 一直走到真实 Qwen Continuous Engine，刻意一次只改变一个变量。</p><ul><li>不是稳定 serving API</li><li>强调中间 tensor 对拍</li></ul></div>
+          <div class="atlas-card"><div class="folder">tests/</div><h3>快速回归测试</h3><p>用 fake model、CPU reference 和参数化输入覆盖状态机、事务、地址映射、失败回滚及文档契约。</p><ul><li>release evidence：180 passed</li><li>默认不依赖联网下载模型</li></ul></div>
+          <div class="atlas-card"><div class="folder">scripts/</div><h3>运行与测量入口</h3><p>环境检查、HF baseline、容量模拟、kernel benchmark、Static/Continuous 对比与一键 release evaluation。</p><ul><li>保存 raw samples</li><li>记录环境和 Git commit</li></ul></div>
+          <div class="atlas-card"><div class="folder">docs/ + milestones/</div><h3>设计与证据</h3><p>解释每个里程碑的语义、失败实验、profiler 边界和验收白名单，防止 smoke 被误当正式结论。</p><ul><li>v0.6 frozen manifest</li><li>v1.0 clean-tree bundle</li></ul></div>
+        </div>
+        <div class="panel" style="margin-top:18px">
+          <div class="kicker">implementation ladder</div>
+          <h3 style="font-size:25px;margin:12px 0 6px">为什么按这个顺序实现</h3>
+          <p style="color:var(--muted);margin:0 0 16px">每一级只引入一个主要变量；否则模型公式、Cache 生命周期和 CUDA 地址错误会混在一起，无法定位。</p>
+          <div class="milestones">
+            <div class="milestone"><b>v0.1</b><span>HF 显式 Prefill / Decode，固定 correctness oracle</span></div>
+            <div class="milestone"><b>v0.2</b><span>独立 Qwen ModelRunner，严格权重映射</span></div>
+            <div class="milestone"><b>v0.3</b><span>连续 KV Cache，证明历史不重算</span></div>
+            <div class="milestone"><b>v0.4</b><span>Paged KV 地址、block 生命周期与碎片</span></div>
+            <div class="milestone"><b>v0.5</b><span>CUDA Paged Attention 与 profiler</span></div>
+            <div class="milestone"><b>v0.6</b><span>Scheduler、Engine、Continuous Batching</span></div>
+            <div class="milestone"><b>v1.0</b><span>clean-tree 复现、证据索引与发布</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section id="lifecycle">
       <div class="shell">
         <div class="section-head">
-          <div><div class="kicker">02 · Lifecycle</div><h2>一次请求的 7 站</h2></div>
+          <div><div class="kicker">03 · Lifecycle</div><h2>一次请求的 7 站</h2></div>
           <p class="section-intro">点击左侧步骤查看每一站的输入、输出与代码落点。这里展示当前同步 Engine 已实际执行的请求生命周期，而不是未来设计草图。</p>
         </div>
         <div class="stepper">
@@ -316,7 +409,7 @@
     <section id="compute">
       <div class="shell">
         <div class="section-head">
-          <div><div class="kicker">03 · Compute</div><h2>Prefill 与 Decode</h2></div>
+          <div><div class="kicker">04 · Compute</div><h2>Prefill 与 Decode</h2></div>
           <p class="section-intro">同一个 Decoder，两种完全不同的工作负载。Prefill 一次吞下整段 prompt；Decode 每个请求只推进一个 token，并复用此前的 KV。</p>
         </div>
         <div class="panel">
@@ -359,7 +452,7 @@
     <section id="cache">
       <div class="shell">
         <div class="section-head">
-          <div><div class="kicker">04 · Memory</div><h2>Paged KV 怎么寻址</h2></div>
+          <div><div class="kicker">05 · Memory</div><h2>Paged KV 怎么寻址</h2></div>
           <p class="section-intro">逻辑上每个请求的 token 连续；物理上它们可以散落在 GPU block pool。点击逻辑 token，观察两次除法如何落到真实物理槽位。</p>
         </div>
         <div class="panel cache-lab">
@@ -387,10 +480,49 @@
       </div>
     </section>
 
+    <section id="kernel">
+      <div class="shell">
+        <div class="section-head">
+          <div><div class="kicker">06 · CUDA Kernel</div><h2>Paged Attention 内部</h2></div>
+          <p class="section-intro">Python 层提供 query、共享物理 K/V pool、block table 与每个请求的有效长度。CUDA v1 不 gather 历史，而是在扫描 token 时现场完成逻辑块到物理块的翻译。</p>
+        </div>
+        <div class="split">
+          <div class="panel">
+            <div class="kicker">launch geometry</div>
+            <h3 style="font-size:25px;margin:12px 0 16px">一个 CTA 算一个 request × query head</h3>
+            <div class="tensor-shape">
+              <div class="shape-row"><span>Grid</span><div class="shape">B × num_query_heads 个 CTA</div></div>
+              <div class="shape-row"><span>Block</span><div class="shape">64 threads = head_dim</div></div>
+              <div class="shape-row"><span>KV Head</span><div class="shape">q_head / (Hq / Hkv)</div></div>
+              <div class="shape-row"><span>输出</span><div class="shape">[B, Hq, 64] FP16</div></div>
+            </div>
+            <div class="callout"><div class="icon">i</div><p>v1 是 correctness baseline：token 串行扫描、shared-memory reduction，没有 half2、warp shuffle、向量化加载或 token 并行。split-KV 保留在实验路径，不参与稳定 dispatch。</p></div>
+          </div>
+          <div class="panel">
+            <div class="kicker">per-token loop</div>
+            <h3 style="font-size:25px;margin:12px 0 16px">内核的 5 个动作</h3>
+            <div class="algo">
+              <div class="algo-step"><i>01</i><div><b>找到物理地址</b><span>logical=t/block_size → physical=table[b,logical] → offset=t%block_size</span></div></div>
+              <div class="algo-step"><i>02</i><div><b>GQA 选择 KV head</b><span>多个 Query Heads 共享同一个 K/V Head。</span></div></div>
+              <div class="algo-step"><i>03</i><div><b>计算 Q·K</b><span>64 个线程各乘一个维度，再在 shared memory 做 reduction。</span></div></div>
+              <div class="algo-step"><i>04</i><div><b>更新 online softmax</b><span>只保存 running max / sum，不物化完整 score vector。</span></div></div>
+              <div class="algo-step"><i>05</i><div><b>累加 Value</b><span>对 V 做重标定后的加权累积，循环结束再除 running_sum。</span></div></div>
+            </div>
+          </div>
+        </div>
+        <div class="panel" style="margin-top:18px">
+          <div class="kicker">numerical core</div>
+          <h3 style="font-size:25px;margin:12px 0 16px">Online Softmax 为什么数值稳定</h3>
+          <div class="formula-large">new_max = max(running_max, score)<br>alpha = exp(running_max - new_max)<br>beta&nbsp; = exp(score - new_max)<br><br>running_sum = running_sum × alpha + beta<br>output_acc = output_acc × alpha + beta × V[t]<br>output = output_acc / running_sum</div>
+          <p style="color:var(--muted);font-size:13px;margin-bottom:0">当新 score 抬高最大值时，历史权重整体乘 <code>alpha</code> 重新缩放，既避免溢出，也无需保存此前所有 score。累加使用 FP32，最终输出转换回 FP16。</p>
+        </div>
+      </div>
+    </section>
+
     <section id="batching">
       <div class="shell">
         <div class="section-head">
-          <div><div class="kicker">05 · Scheduling</div><h2>Continuous Batching</h2></div>
+          <div><div class="kicker">07 · Scheduling</div><h2>Continuous Batching</h2></div>
           <p class="section-intro">Batch 不是固定不变的。每个 step 都先保障正在生成的请求 Decode 一次，再用剩余 token budget 从 waiting 队首接纳完整 prompt。</p>
         </div>
         <div class="panel sim-grid">
@@ -404,13 +536,128 @@
           <div class="timeline" id="timeline"></div>
         </div>
         <div class="callout"><div class="icon">!</div><p><strong>当前 Engine 边界：</strong> <code>ContinuousBatchEngine</code> 已自动拆分 Prefill / Decode 子批、调用 Runner、统一同步 token、写回 Scheduler 并释放 blocks。当前仍是同步 Engine：Prefill 逐请求执行且位于 batched Decode 之前，不支持 chunked prefill、preemption 或 CPU/GPU overlap。</p></div>
+        <div class="callout"><div class="icon">i</div><p><strong>KV 容量边界：</strong>稳定 Admission 在接纳时预留整个生成期所需 block。独立的<a href="../experiments/one_step_block_demand.py">单步只读估算器</a>可以根据活动请求、free block 与下一步 Decode/Prefill 计算缺口，但只能判断这一轮是否放得下，不能代替全生命周期的容量保证。原理见<a href="kv_reservation_analysis.md">KV 预留容量分析</a>。</p></div>
+        <div class="split" style="margin-top:18px">
+          <div class="panel">
+            <div class="kicker">scheduler decision order</div>
+            <h3 style="font-size:23px;margin:12px 0 15px">schedule_step() 精确顺序</h3>
+            <div class="algo">
+              <div class="algo-step"><i>1</i><div><b>拒绝重入</b><span>若上个 outstanding batch 尚未 apply/abort，禁止再次调度。</span></div></div>
+              <div class="algo-step"><i>2</i><div><b>先放全部 running Decode</b><span>每个请求成本恒为 1，保证活跃请求每 step 前进一步。</span></div></div>
+              <div class="algo-step"><i>3</i><div><b>计算剩余 slot 与 token budget</b><span>batch_tokens = Σ decode(1) + Σ admitted prompt length。</span></div></div>
+              <div class="algo-step"><i>4</i><div><b>严格 FIFO 接纳 whole Prefill</b><span>队首放不下就停止，不切 prompt，也不绕过它挑短请求。</span></div></div>
+              <div class="algo-step"><i>5</i><div><b>Admission 原子预留 blocks</b><span>资源不足时无副作用返回 False；请求继续 waiting。</span></div></div>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="kicker">controlled comparison</div>
+            <h3 style="font-size:23px;margin:12px 0 15px">Continuous 与 Static 只差哪里</h3>
+            <div class="code-block">CONTINUOUS
+step 0  Prefill A, B
+step 1  Decode A + Prefill C   ← 动态 refill
+step 2  Decode A, C
+
+STATIC (no-refill cohort)
+step 0  Prefill A, B
+step 1  Decode A               ← C 等 cohort 排空
+step 2  Decode A
+step 3  Prefill C</div>
+            <p style="color:var(--muted);font-size:13px">两种策略共用同一 Engine、Runner、KV Cache、Paged Attention 和 workload，只改变已有 cohort 未结束时能否补入新请求，因此性能差异主要来自 admission policy。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="engine">
+      <div class="shell">
+        <div class="section-head">
+          <div><div class="kicker">08 · Orchestration</div><h2>Engine 一个 step</h2></div>
+          <p class="section-intro"><code>ContinuousBatchEngine</code> 是把独立组件变成 runtime 的那层胶水。它不实现 Transformer，也不决定调度策略；它负责转换数据、确定调用顺序、同步结果和处理失败。</p>
+        </div>
+        <div class="panel">
+          <div class="sequence">
+            <div class="sequence-row"><div class="sequence-who">Engine</div><div class="sequence-line"></div><div class="sequence-action"><strong>scheduler.schedule_step()</strong><p>得到 mixed SchedulerBatch：items 保留逻辑顺序，同时暴露 prefill_request_ids / decode_request_ids。</p></div></div>
+            <div class="sequence-row"><div class="sequence-who">Prefill</div><div class="sequence-line"></div><div class="sequence-action"><strong>逐个执行新请求</strong><p>构造 [1,S] input tensor，以 PagedRequestKVCache 写入已预留 blocks；GPU 上完成 argmax，但暂不回写 Scheduler。</p></div></div>
+            <div class="sequence-row"><div class="sequence-who">Decode Batch</div><div class="sequence-line"></div><div class="sequence-action"><strong>一次 decode_batch([B,1])</strong><p>PagedBatchDecodeAdapter 保持 Scheduler 的 request 顺序，各层共享一份 block table / lengths metadata。</p></div></div>
+            <div class="sequence-row"><div class="sequence-who">Engine</div><div class="sequence-line"></div><div class="sequence-action"><strong>按 batch.items 原顺序重排 token</strong><p>模型执行顺序是 Prefill→Decode，可能不同于 Scheduler items；必须按 request_id 恢复归属。</p></div></div>
+            <div class="sequence-row"><div class="sequence-who">GPU → CPU</div><div class="sequence-line"></div><div class="sequence-action"><strong>一次 .cpu().tolist() 同步</strong><p>不逐请求 .item()；一个 step 的所有 greedy token 在一次 D2H barrier 后对控制面可见。</p></div></div>
+            <div class="sequence-row"><div class="sequence-who">Scheduler</div><div class="sequence-line"></div><div class="sequence-action"><strong>apply_step_results()</strong><p>检查 ID 集合、追加 token、判断 EOS/max tokens、迁移 RUNNING→FINISHED。</p></div></div>
+            <div class="sequence-row"><div class="sequence-who">Admission</div><div class="sequence-line"></div><div class="sequence-action"><strong>release_finished()</strong><p>释放完成请求 block table 的所有物理块，并记录 token ready / completion 指标。</p></div></div>
+          </div>
+        </div>
+        <div class="split" style="margin-top:18px">
+          <div class="panel">
+            <div class="kicker">why prefill first</div>
+            <h3 style="font-size:24px;margin:12px 0">为什么 mixed step 先 Prefill</h3>
+            <p style="color:var(--muted)">新 Prefill 成功后结果仍未写回 Scheduler；旧请求 Decode 最后执行且自身有跨请求事务。若任意调用失败，可以释放本轮新 reservation，再让 Scheduler abort，整个 step 可原样重试。</p>
+            <div class="code-block">try:
+  run_each_prefill()
+  run_one_batched_decode()
+except:
+  admission.release_admitted(prefill_ids)
+  scheduler.abort_step()
+  raise</div>
+          </div>
+          <div class="panel">
+            <div class="kicker">rollback invariants</div>
+            <h3 style="font-size:24px;margin:12px 0">失败后必须恢复什么</h3>
+            <div class="algo">
+              <div class="algo-step"><i>A</i><div><b>Cache</b><span>Decode pending 全部 abort；Prefill reservation 全部释放。</span></div></div>
+              <div class="algo-step"><i>B</i><div><b>队列</b><span>本轮新接纳请求回 waiting 队首，保持原 arrival FIFO。</span></div></div>
+              <div class="algo-step"><i>C</i><div><b>请求状态</b><span>不得出现部分 generated tokens 或错误的 prefilled=True。</span></div></div>
+              <div class="algo-step"><i>D</i><div><b>逻辑 step</b><span>失败尝试不消耗 step_index，重试仍使用相同编号。</span></div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="evidence">
+      <div class="shell">
+        <div class="section-head">
+          <div><div class="kicker">09 · Metrics & Evidence</div><h2>怎么证明它正确且更快</h2></div>
+          <p class="section-intro">项目把“数学正确、状态正确、端到端正确、性能结论”分开验证。一次能跑通的 demo 不能代替 benchmark，一次 kernel 加速也不能直接推导用户 TTFT。</p>
+        </div>
+        <div class="panel">
+          <div class="kicker">request-visible timeline</div>
+          <h3 style="font-size:25px;margin:12px 0">指标从用户时间线推导</h3>
+          <div class="metric-track">
+            <div class="metric-segment"><b>Arrival / Waiting</b><code>arrival_ns</code></div>
+            <div class="metric-segment"><b>Prefill</b><code>prefill_started</code></div>
+            <div class="metric-segment token"><b>Token 0</b><code>TTFT</code></div>
+            <div class="metric-segment token"><b>Token 1 … N</b><code>inter-token / E2E</code></div>
+            <div class="metric-segment cleanup"><b>Cleanup</b><code>post-token</code></div>
+          </div>
+          <div class="formula-large">queue wait = first prefill start − arrival<br>TTFT = first token ready − arrival<br>TPOT[i] = token[i+1] ready − token[i] ready<br>E2E = last token ready − arrival<br>post-token = blocks released − last token ready</div>
+        </div>
+        <div class="panel" style="margin-top:18px">
+          <div class="kicker">clean-tree formal result · 8-request burst</div>
+          <h3 style="font-size:25px;margin:12px 0 16px">Continuous 相对 Static 的正式结果</h3>
+          <div class="metric-grid">
+            <div class="metric-card highlight"><small>THROUGHPUT</small><strong>70.67</strong><span>tok/s · +8.18%</span></div>
+            <div class="metric-card"><small>TTFT MEDIAN</small><strong>183.71</strong><span>ms · −44.54%</span></div>
+            <div class="metric-card"><small>E2E MEDIAN</small><strong>418.88</strong><span>ms · −11.99%</span></div>
+            <div class="metric-card"><small>TPOT MEDIAN</small><strong>25.59</strong><span>ms · +6.64%（更慢）</span></div>
+          </div>
+          <p style="color:var(--muted);font-size:13px;margin-bottom:0">结论只适用于 Qwen2.5-0.5B FP16、RTX 3060 Laptop、固定 8-request burst workload。动态 refill 降低排队并提升总体吞吐，但 mixed Prefill 会阻塞已有 Decode，导致 TPOT 略差。</p>
+        </div>
+        <div class="evidence" style="margin-top:18px">
+          <div class="evidence-card"><div class="level">LEVEL 1</div><h4>数学 / Tensor</h4><p>手写 Attention、RoPE、RMSNorm、MLP 与 HF 中间 tensor 逐层对拍。</p></div>
+          <div class="evidence-card"><div class="level">LEVEL 2</div><h4>状态 / 地址</h4><p>跨块增长、OOM 原子性、double-free、batch row、commit/abort 与 block 复用。</p></div>
+          <div class="evidence-card"><div class="level">LEVEL 3</div><h4>端到端 HF Gate</h4><p>late admission、mixed step、batched Decode、跨块序列与完整 greedy tokens exact match。</p></div>
+          <div class="evidence-card"><div class="level">LEVEL 4</div><h4>正式 Benchmark</h4><p>warmup、多轮交错、raw JSON/CSV、环境、commit、clean tree 和 artifact SHA-256。</p></div>
+        </div>
+        <div class="panel" style="margin-top:18px">
+          <div class="kicker">scope boundary</div><h3 style="font-size:25px;margin:12px 0 16px">v1.0 没有声称什么</h3>
+          <div class="limits"><div class="limit">没有异步 CPU/GPU overlap，也没有多 stream 流水线。</div><div class="limit">没有 chunked prefill、preemption、priority 或 cancellation。</div><div class="limit">只支持 greedy decoding，不含 temperature、top-k/top-p。</div><div class="limit">单 GPU、Qwen2.5-0.5B、FP16、CUDA kernel head_dim=64。</div><div class="limit">正式 workload 是短 prompt 的 8-request burst，不代表在线流量。</div><div class="limit">WSL2 Nsight Systems 未捕获 GPU kernel timeline，不能推断真实 device idle。</div></div>
+        </div>
       </div>
     </section>
 
     <section id="code-map">
       <div class="shell">
         <div class="section-head">
-          <div><div class="kicker">06 · Source Map</div><h2>从概念回到代码</h2></div>
+          <div><div class="kicker">10 · Source Map</div><h2>从概念回到代码</h2></div>
           <p class="section-intro">以下不是“未来设计图”，而是当前仓库对象的职责与成熟度。文件链接可直接跳到源码。</p>
         </div>
         <div class="panel table-scroll">
@@ -418,16 +665,51 @@
             <thead><tr><th>组件</th><th>关键职责</th><th>主入口</th><th>状态</th></tr></thead>
             <tbody>
               <tr><td><strong>RequestScheduler</strong></td><td>队列、token budget、Decode 优先、结果写回</td><td><a class="file" href="../src/mini_llm_runtime/scheduler.py">scheduler.py</a></td><td><span class="badge done">完成</span></td></tr>
+              <tr><td><strong>Qwen Loader</strong></td><td>config / safetensors 读取与严格权重 schema 映射</td><td><a class="file" href="../src/mini_llm_runtime/qwen_loader.py">qwen_loader.py</a></td><td><span class="badge done">完成</span></td></tr>
               <tr><td><strong>Admission Controller</strong></td><td>接纳时保守预留请求全生命周期 blocks</td><td><a class="file" href="../src/mini_llm_runtime/block_admission.py">block_admission.py</a></td><td><span class="badge done">完成</span></td></tr>
+              <tr><td><strong>单步容量估算实验</strong></td><td>只读检查下一步 Decode + Prefill 的新增 block 需求；不参与稳定调度</td><td><a class="file" href="../experiments/one_step_block_demand.py">one_step_block_demand.py</a></td><td><span class="badge future">实验</span></td></tr>
               <tr><td><strong>Paged KV Manager</strong></td><td>block pool、request table、GPU storage、metadata、释放</td><td><a class="file" href="../src/mini_llm_runtime/paged_kv_manager.py">paged_kv_manager.py</a></td><td><span class="badge done">完成</span></td></tr>
               <tr><td><strong>Qwen Runner</strong></td><td>Prefill、单请求 Decode、多请求 batched Decode</td><td><a class="file" href="../src/mini_llm_runtime/qwen_model_runner.py">qwen_model_runner.py</a></td><td><span class="badge done">完成</span></td></tr>
               <tr><td><strong>Batch Adapter</strong></td><td>保持 request row 顺序，统一 Decode transaction 与 metadata</td><td><a class="file" href="../src/mini_llm_runtime/paged_batch.py">paged_batch.py</a></td><td><span class="badge done">完成</span></td></tr>
               <tr><td><strong>CUDA Attention</strong></td><td>block-table 间接寻址、GQA、online softmax</td><td><a class="file" href="../csrc/paged_attention_cuda.cu">paged_attention_cuda.cu</a></td><td><span class="badge done">v1</span></td></tr>
               <tr><td><strong>Generation Loop</strong></td><td>Prefill + N−1 次 Decode 的单请求 greedy loop</td><td><a class="file" href="../src/mini_llm_runtime/generation.py">generation.py</a></td><td><span class="badge done">单请求</span></td></tr>
               <tr><td><strong>ContinuousBatchEngine</strong></td><td>拆分 Prefill/Decode、token 写回、失败回滚与完成释放</td><td><a class="file" href="../src/mini_llm_runtime/engine.py">engine.py</a></td><td><span class="badge done">同步版完成</span></td></tr>
+              <tr><td><strong>Request Metrics</strong></td><td>arrival、token ready、completion 事件与 TTFT/TPOT/E2E</td><td><a class="file" href="../src/mini_llm_runtime/request_metrics.py">request_metrics.py</a></td><td><span class="badge done">完成</span></td></tr>
+              <tr><td><strong>HF Oracle</strong></td><td>不调用 generate() 的显式 Prefill / Decode correctness reference</td><td><a class="file" href="../src/mini_llm_runtime/hf_baseline.py">hf_baseline.py</a></td><td><span class="badge done">验证用</span></td></tr>
+              <tr><td><strong>Release Evaluation</strong></td><td>临时 clean worktree、全测、HF gate、benchmark、manifest</td><td><a class="file" href="../scripts/run_release_evaluation.py">run_release_evaluation.py</a></td><td><span class="badge done">v1.0</span></td></tr>
               <tr><td><strong>高级调度</strong></td><td>chunked prefill、preemption、priority、cancellation</td><td><code>尚未实现</code></td><td><span class="badge future">未来</span></td></tr>
             </tbody>
           </table>
+        </div>
+        <div class="split" style="margin-top:18px">
+          <div class="panel">
+            <div class="kicker">recommended reading path</div>
+            <h3 style="font-size:23px;margin:12px 0 15px">建议按这 5 个文件读源码</h3>
+            <div class="algo">
+              <div class="algo-step"><i>1</i><div><b>scheduler.py</b><span>先掌握 request state 与一个 step 如何组成。</span></div></div>
+              <div class="algo-step"><i>2</i><div><b>engine.py</b><span>看控制面如何转成真正的模型调用。</span></div></div>
+              <div class="algo-step"><i>3</i><div><b>qwen_model_runner.py</b><span>看 Prefill / Decode 与 Decoder layer 数学。</span></div></div>
+              <div class="algo-step"><i>4</i><div><b>paged_kv_cache.py + paged_batch.py</b><span>理解地址、事务和变长 batch。</span></div></div>
+              <div class="algo-step"><i>5</i><div><b>paged_attention_cuda.cu</b><span>最后进入 GPU 地址计算和 online softmax。</span></div></div>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="kicker">reproduce locally</div>
+            <h3 style="font-size:23px;margin:12px 0 15px">从快速检查到正式复现</h3>
+            <div class="code-block"># 环境与 CPU/快速单测
+source /home/eran/venvs/torch/bin/activate
+python scripts/check_environment.py
+python -m pytest -q
+
+# 真实 Qwen Continuous Engine correctness
+TORCH_CUDA_ARCH_LIST=8.6 python -m \
+  experiments.continuous_batch_engine_runner \
+  --local-files-only
+
+# 临时 clean worktree 中执行完整 release gate
+python scripts/run_release_evaluation.py \
+  --output-dir benchmarks/results/new_release</div>
+          </div>
         </div>
       </div>
     </section>
@@ -435,7 +717,7 @@
     <section id="rules">
       <div class="shell">
         <div class="section-head">
-          <div><div class="kicker">07 · Mental Model</div><h2>必须守住的契约</h2></div>
+          <div><div class="kicker">11 · Mental Model</div><h2>必须守住的契约</h2></div>
           <p class="section-intro">理解这六条，基本就抓住了整个项目最容易出错、也最有价值的部分。</p>
         </div>
         <div class="invariants">
@@ -450,7 +732,7 @@
     </section>
   </main>
 
-  <footer><div class="shell"><span>状态已按 clean-tree release evidence · <code>e01c3c7</code> 更新</span><span>建议从「生命周期」开始交互浏览</span></div></footer>
+  <footer><div class="shell"><span>页面覆盖 v1.1.0 源码；展示的性能数字来自旧 clean-tree evidence <code>e01c3c7</code>，不是 v1.1.0 新测试</span><span>建议按「项目地图 → 生命周期 → Engine」顺序阅读</span></div></footer>
 
   <script>
     const steps = [

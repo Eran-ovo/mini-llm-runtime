@@ -1,0 +1,41 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>术语表 · mini-vLLM</title><link rel="stylesheet" href="assets/style.css"></head>
+<body data-page="glossary"><div class="layout"><main class="page"><article class="content">
+  <div class="crumb">Appendix · Glossary</div><h1>术语表与 Shape 速查</h1><p class="lead">阅读源码时遇到不熟悉的词，可以随时回到这里。</p>
+  <section class="chapter"><h2>核心术语</h2><dl class="glossary">
+    <dt>Token</dt><dd>Tokenizer 词表中的基本片段，用整数 ID 表示，不一定等于字或单词。</dd>
+    <dt>Tensor</dt><dd>带 dtype、device 和 shape 的多维数组；PyTorch 模型数据的基本载体。</dd>
+    <dt>Embedding</dt><dd>按 token ID 从 [V,H] 权重矩阵查行，得到 token 的 H 维向量。</dd>
+    <dt>Hidden State</dt><dd>模型内部每个 token 当前的向量表示，通常 shape [B,S,H]。</dd>
+    <dt>Logits</dt><dd>词表每个 token 的未归一化分数，最后一维是 V。</dd>
+    <dt>Greedy Decoding</dt><dd>每步直接选择 argmax token 的生成策略。</dd>
+    <dt>Prefill</dt><dd>一次处理完整 prompt，建立 K/V Cache 并产生首 token。</dd>
+    <dt>Decode</dt><dd>每次只处理一个新 token，复用历史 K/V，产生下一个 token。</dd>
+    <dt>Attention</dt><dd>用 Q·K 相似度形成权重，再对 V 加权求和的机制。</dd>
+    <dt>Q / K / V</dt><dd>Query、Key、Value；由 hidden state 经过不同线性投影得到。</dd>
+    <dt>Head</dt><dd>把 hidden 维分成多个独立注意力子空间。</dd>
+    <dt>GQA</dt><dd>Grouped Query Attention；多个 Query heads 共享较少的 KV heads。</dd>
+    <dt>RoPE</dt><dd>Rotary Position Embedding；把位置通过旋转编码进 Q/K。</dd>
+    <dt>RMSNorm</dt><dd>基于均方根的归一化，不减均值。</dd>
+    <dt>SwiGLU</dt><dd>Qwen MLP：SiLU(gate projection) × up projection，再 down projection。</dd>
+    <dt>KV Cache</dt><dd>持久保存各层历史 token 的 K/V，避免 Decode 重算历史。</dd>
+    <dt>Block</dt><dd>Paged KV 的固定大小物理分配单元，包含 block_size 个 token slots。</dd>
+    <dt>Block Table</dt><dd>单请求的逻辑 block index 到物理 block ID 的映射。</dd>
+    <dt>Internal Fragmentation</dt><dd>已分配 block 最后未使用的 token slots。</dd>
+    <dt>Pending</dt><dd>已经分配/写入但尚未 commit、对普通读取不可见的 token 区间。</dd>
+    <dt>Transaction</dt><dd>begin→write→commit/abort 的原子可见性协议。</dd>
+    <dt>Scheduler</dt><dd>维护请求状态并决定当前 step 执行哪些 Prefill/Decode 的控制面。</dd>
+    <dt>Admission</dt><dd>接纳 waiting 请求进入 running 前的资源检查和 block 预留。</dd>
+    <dt>Continuous Batching</dt><dd>每个 step 允许完成请求离开、新请求补入，batch 动态变化。</dd>
+    <dt>Static Batching</dt><dd>本项目指 no-refill cohort：当前 cohort 未排空时不接纳新请求。</dd>
+    <dt>CTA</dt><dd>CUDA Cooperative Thread Array，即一个 thread block。</dd>
+    <dt>Online Softmax</dt><dd>边扫描 score 边更新 max/sum/output，不物化完整 attention vector。</dd>
+    <dt>D2H</dt><dd>Device to Host；GPU 数据同步回 CPU。</dd>
+    <dt>TTFT</dt><dd>Time To First Token：arrival 到第一个 token 可见。</dd>
+    <dt>TPOT</dt><dd>Time Per Output Token：相邻输出 token 的 ready 时间差。</dd>
+    <dt>E2E</dt><dd>End-to-End：arrival 到最后 token 可见。</dd>
+    <dt>Oracle</dt><dd>用于定义正确答案的可信 reference，本项目主要使用 Hugging Face 显式 forward。</dd>
+  </dl></section>
+  <section class="chapter"><h2>常用 Shape</h2><table class="shape-table"><thead><tr><th>Tensor</th><th>Shape</th></tr></thead><tbody><tr><td>input_ids</td><td>[B,S]</td></tr><tr><td>hidden_states</td><td>[B,S,H]</td></tr><tr><td>Q</td><td>[B,Hq,S,D]</td></tr><tr><td>K/V（模型层内）</td><td>[B,Hkv,S,D]</td></tr><tr><td>连续 Cache</td><td>[L,B,Hkv,capacity,D]</td></tr><tr><td>Paged storage</td><td>[L,P,Hkv,block_size,D]</td></tr><tr><td>Decode CUDA query</td><td>[B,Hq,D]</td></tr><tr><td>block_table</td><td>[B,max_blocks]</td></tr><tr><td>sequence_lengths</td><td>[B]</td></tr><tr><td>logits</td><td>[B,S,V]</td></tr></tbody></table></section>
+  <section class="chapter"><h2>最后的自检清单</h2><ul class="checklist"><li>能解释为什么第一个输出 token 来自 Prefill logits</li><li>能解释生成 N 个 token 为什么最多 Decode N−1 次</li><li>能从 token index 算出 physical block 和 offset</li><li>能区分 RoPE position 与 Attention sequence length</li><li>能解释为什么 commit 必须等全部层完成</li><li>能解释 batch row 顺序为什么是安全契约</li><li>能描述 Scheduler、Engine、Runner、Manager 的职责边界</li><li>能区分 correctness reference、kernel benchmark 和端到端 benchmark</li></ul></section>
+  <div class="pager"><a href="11-reading-lab.html"><small>上一页</small>← 11 · 源码阅读实战</a><a href="index.html"><small>回到起点</small>教程首页 →</a></div>
+</article></main></div><script src="assets/app.js"></script></body></html>

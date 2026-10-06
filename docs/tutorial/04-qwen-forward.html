@@ -1,0 +1,92 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>04 Qwen 前向计算 · mini-vLLM</title><link rel="stylesheet" href="assets/style.css"></head>
+<body data-page="04-qwen-forward"><div class="layout"><main class="page"><article class="content">
+  <div class="crumb">Chapter 04 · Qwen Forward</div><h1>逐函数拆解 Qwen ModelRunner</h1><p class="lead">这一页对应 <code>qwen_model_runner.py</code>。目标不是推导所有数学证明，而是能看懂每个函数接收什么 shape、做了什么、为什么这样排序。</p>
+
+  <section class="chapter"><h2>1. 顶层 Prefill 调用链</h2>
+    <div class="diagram"><div class="flow"><div class="node"><strong>input_ids</strong><small>[B,S]</small></div><div class="arrow">→</div><div class="node blue"><strong>Embedding</strong><small>[B,S,H]</small></div><div class="arrow">→</div><div class="node green"><strong>24 × Decoder</strong><small>[B,S,H]</small></div><div class="arrow">→</div><div class="node orange"><strong>Final RMSNorm</strong><small>[B,S,H]</small></div><div class="arrow">→</div><div class="node"><strong>LM Head</strong><small>[B,S,V]</small></div></div></div>
+    <pre><code>x = F.embedding(input_ids, self.weights.embedding)
+for layer_index, layer in enumerate(self.weights.layers):
+    x = _decoder_layer(x, positions, layer, config, ...)
+x = _rms_norm(x, self.weights.final_norm, config.rms_norm_eps)
+logits = F.linear(x, self.weights.embedding)</code></pre>
+    <p><code>@torch.inference_mode()</code> 关闭 autograd：推理不需要保存反向传播中间量，能减少显存和框架开销。</p>
+  </section>
+
+  <section class="chapter"><h2>2. Embedding：ID 变向量</h2>
+    <p>Embedding 矩阵 shape 是 <code>[V,H]</code>。<code>F.embedding</code> 本质上按 token ID 选行，不是矩阵乘法。</p>
+    <div class="example"><div class="example-title">玩具例子：V=5, H=3</div><pre><code>embedding = [
+  [0.1, 0.2, 0.3],  # token 0
+  [0.7, 0.0, 0.4],  # token 1
+  ...
+]
+input_ids = [[1, 0]]
+output = [[[0.7,0.0,0.4], [0.1,0.2,0.3]]]  # [1,2,3]</code></pre></div>
+  </section>
+
+  <section class="chapter"><h2>3. 一层 Decoder 的两条残差支路</h2>
+    <div class="diagram"><div class="stack"><div class="stack-row"><strong>输入 x</strong><span class="tensor">[B,S,H]</span></div><div class="stack-row"><strong>RMSNorm → Attention</strong>结果与原 x 相加（第一条 residual）</div><div class="stack-row"><strong>RMSNorm → SwiGLU MLP</strong>结果再与 residual 相加</div><div class="stack-row"><strong>输出</strong><span class="tensor">[B,S,H]</span></div></div></div>
+    <pre><code>residual = x
+x = _rms_norm(x, input_norm, eps)
+x = residual + _attention(x, ...)
+
+residual = x
+x = _rms_norm(x, post_attention_norm, eps)
+gate = F.silu(F.linear(x, gate_weight))
+up = F.linear(x, up_weight)
+x = F.linear(gate * up, down_weight)
+return residual + x</code></pre>
+    <div class="callout"><div class="icon">i</div><p>Residual 让每个子模块学习“对现有表示的修正”，并给深层网络提供稳定的信息通道。两次赋值 <code>residual = x</code> 对应两条不同的残差支路。</p></div>
+  </section>
+
+  <section class="chapter"><h2>4. RMSNorm：只看均方根</h2>
+    <div class="formula">rms = sqrt(mean(x²) + ε)<br>normalized = x / rms<br>output = weight × normalized</div>
+    <pre><code>dtype = x.dtype
+x_fp32 = x.float()
+normalized = x_fp32 * torch.rsqrt(
+    x_fp32.pow(2).mean(-1, keepdim=True) + epsilon
+)
+return weight * normalized.to(dtype)</code></pre>
+    <p>中间转 FP32 是为了减少半精度求平方、均值、倒平方根时的数值误差；最后再转回输入 dtype。</p>
+  </section>
+
+  <section class="chapter"><h2>5. Q/K/V Projection 与多头 reshape</h2>
+    <p>线性层先输出扁平的最后一维，再由 <code>_heads()</code> 拆成 head，并把 head 维移到 sequence 前面：</p>
+    <div class="formula">[B,S,Hq×D] → reshape [B,S,Hq,D] → transpose → [B,Hq,S,D]</div>
+    <table class="shape-table"><thead><tr><th>对象</th><th>Projection 后</th><th>拆 head 后</th></tr></thead><tbody><tr><td>Q</td><td>[B,S,H]</td><td>[B,Hq,S,D]</td></tr><tr><td>K</td><td>[B,S,Hkv×D]</td><td>[B,Hkv,S,D]</td></tr><tr><td>V</td><td>[B,S,Hkv×D]</td><td>[B,Hkv,S,D]</td></tr></tbody></table>
+    <h3>GQA：为什么 Q head 比 KV head 多？</h3>
+    <p>Grouped Query Attention 让一组相邻 Query heads 共享一个 KV head，以减少 Cache 大小和读取量。</p>
+    <div class="example"><div class="example-title">Hq=8, Hkv=2</div><p><code>group_size = 8/2 = 4</code>。Q heads 0–3 使用 KV head 0；Q heads 4–7 使用 KV head 1。</p><div class="formula">kv_head = query_head // group_size</div></div>
+  </section>
+
+  <section class="chapter"><h2>6. RoPE：把位置信息旋转进 Q/K</h2>
+    <p>纯 Attention 不知道 token 顺序。RoPE 为每个位置生成 cos/sin，用二维成对旋转作用到 Q 和 K。V 不做 RoPE。</p>
+    <pre><code>frequencies = position_ids * inv_freq
+cos, sin = frequencies.cos(), frequencies.sin()
+query = query * cos + rotate_half(query) * sin
+key   = key   * cos + rotate_half(key)   * sin</code></pre>
+    <div class="callout warn"><div class="icon">!</div><p>Decode 新 token 的 position 不是 0，而是追加前的 Cache 长度。若历史长度是 17，新 token 的 position 必须是 17。</p></div>
+  </section>
+
+  <section class="chapter"><h2>7. Attention 两条路径</h2>
+    <div class="grid-2"><div class="card"><span class="label">Torch / Prefill</span><h3>连续数学路径</h3><p>必要时 repeat K/V，再算完整 scores。Prefill 使用 causal mask，禁止位置 i 看未来位置 j&gt;i。</p><pre><code>scores = Q @ K.transpose(-2,-1) / sqrt(D)
+scores = scores.masked_fill(future, min_value)
+prob = softmax(scores, dtype=float32)
+per_head = prob @ V</code></pre></div><div class="card"><span class="label">Paged CUDA / Decode</span><h3>物理块路径</h3><p>query length 必须为 1。K/V 先写入 pending slot，kernel 用 block table 直接遍历历史，不 gather 连续副本。</p><pre><code>inputs = cache.paged_attention_inputs(layer)
+per_head = paged_decode_attention_cuda(
+    query[:, :, 0, :],
+    inputs.key_cache,
+    inputs.value_cache,
+    inputs.block_table,
+    inputs.sequence_lengths,
+)</code></pre></div></div>
+  </section>
+
+  <section class="chapter"><h2>8. Decode 为什么包含“当前 token 自己”</h2>
+    <p>Decode 的输入 token 是上一步已经选出的 token。它先产生当前 token 的 K/V 并写入 Cache，然后当前 Q 可以注意包括自己在内的完整前缀。因此：</p>
+    <div class="formula">position_id = old_cache_length<br>attention_sequence_length = old_cache_length + 1</div>
+    <p>这是项目里最常见的 off-by-one 风险。position 用于 RoPE；sequence length 用于 Paged Attention 读多少 K/V，它们不能共用同一个数。</p>
+    <details class="quiz"><summary>检查：为什么 Prefill 需要 causal mask，而单 token Decode 不需要显式 mask？</summary><div class="answer">Prefill 同时包含多个位置，必须禁止早期位置看到后面的未来 token。Decode 只有序列末尾的一个 Query，它面对的 Cache 全部是允许看到的过去和当前 token，所以无需再构造 mask。</div></details>
+    <a class="source-link" href="../../src/mini_llm_runtime/qwen_model_runner.py">qwen_model_runner.py</a><a class="source-link" href="../../experiments/manual_qwen_attention.py">手写 Attention</a><a class="source-link" href="../../experiments/manual_qwen_decoder_layer.py">手写 Decoder Layer</a>
+  </section>
+  <div class="pager"><a href="03-model-loading.html"><small>上一页</small>← 03 · 模型加载</a><a href="05-kv-cache.html"><small>下一页</small>05 · KV Cache →</a></div>
+</article></main></div><script src="assets/app.js"></script></body></html>

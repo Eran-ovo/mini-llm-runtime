@@ -1,0 +1,83 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>07 CUDA Paged Attention · mini-vLLM</title><link rel="stylesheet" href="assets/style.css"></head>
+<body data-page="07-paged-attention"><div class="layout"><main class="page"><article class="content">
+  <div class="crumb">Chapter 07 · CUDA Paged Attention</div><h1>从 Python Reference 到 CUDA Kernel</h1><p class="lead">先用最清晰的 Python 实现定义“正确答案”，再让 CUDA 保持相同的地址映射和数学语义。理解这一章的关键，是把逻辑 token 顺序、物理 block 地址和 softmax 三件事分开。</p>
+
+  <section class="chapter"><h2>1. Kernel 接收什么</h2>
+    <table class="shape-table"><thead><tr><th>输入</th><th>shape</th><th>意义</th></tr></thead><tbody><tr><td>query</td><td>[B,Hq,D]</td><td>每个请求当前唯一的 Decode Query</td></tr><tr><td>key/value_cache</td><td>[P,Hkv,BS,D]</td><td>单层物理 block pool</td></tr><tr><td>block_table</td><td>[B,max_blocks]</td><td>每个请求的逻辑→物理映射</td></tr><tr><td>sequence_lengths</td><td>[B]</td><td>每行真正可读 token 数</td></tr></tbody></table>
+    <div class="callout"><div class="icon">i</div><p>ModelRunner 的完整 storage 有 layer 维。调用单层 Attention 时使用 <code>storage.key[layer_index]</code>，所以 kernel 看到的正好是四维 <code>[P,Hkv,BS,D]</code> view，没有复制。</p></div>
+  </section>
+
+  <section class="chapter"><h2>2. Python Reference 如何定义语义</h2>
+    <div class="steps"><div class="step"><div><b>按请求读取 sequence_length</b><p>计算 <code>required_blocks = ceil(length/block_size)</code>。</p></div></div><div class="step"><div><b>按逻辑 block 查物理 block</b><p>尾块只读取 <code>valid_tokens</code>，绝不碰未初始化 padding。</p></div></div><div class="step"><div><b>按 GQA 映射选择 KV head</b><p>相邻 Query heads 共享 KV head。</p></div></div><div class="step"><div><b>拼接全部 block 的 scores</b><p>softmax 必须跨完整序列统一归一化，不能每块独立 softmax。</p></div></div><div class="step"><div><b>用同样逻辑顺序消费 V</b><p>FP32 加权累积，最后转回 query dtype。</p></div></div></div>
+    <pre><code>for logical_block in range(required_blocks):
+    physical = block_table[b, logical_block]
+    key_block = key_cache[physical, :, :valid_tokens, :]
+    scores = einsum("hd,htd->ht", query[b], key_block)
+    score_chunks.append(scores * scale)
+
+joined = torch.cat(score_chunks, dim=-1)
+probabilities = torch.softmax(joined.float(), dim=-1)</code></pre>
+    <div class="callout warn"><div class="icon">!</div><p>Reference 中的 Python loop、<code>.item()</code> GPU 同步和完整 score tensor 都很慢，但它们让逻辑一目了然。它是数值 oracle，不是 benchmark 对象。</p></div>
+  </section>
+
+  <section class="chapter"><h2>3. CUDA v1 的线程映射</h2>
+    <div class="formula">grid.x = batch × num_query_heads<br>block.x = 64 threads = head_dim<br>一个 CTA = 一个 (request, query_head)</div>
+    <div class="example"><div class="example-title">B=3, Hq=14</div><p>总共 launch 42 个 CTA。CTA 0–13 属于 request 0，14–27 属于 request 1，28–41 属于 request 2。每个 CTA 的 64 个线程分别负责输出向量的一个维度。</p></div>
+    <pre><code>const int query_head = blockIdx.x % num_query_heads;
+const int batch_index = blockIdx.x / num_query_heads;
+const int dim = threadIdx.x;
+
+const int group_size = num_query_heads / num_kv_heads;
+const int kv_head = query_head / group_size;</code></pre>
+  </section>
+
+  <section class="chapter"><h2>4. 每个历史 token 的地址计算</h2>
+    <pre><code>for (int token_index = 0;
+     token_index &lt; sequence_length;
+     ++token_index) {
+  logical_block = token_index / block_size;
+  block_offset  = token_index % block_size;
+  physical_block = block_table[
+      batch_index * max_blocks + logical_block];
+
+  cache_offset = (((physical_block * Hkv + kv_head)
+                   * block_size + block_offset) * 64);
+}</code></pre>
+    <p>这段整数运算与上一章 <code>RequestBlockTable.locate()</code> 完全相同，只是从 Python CPU 元数据搬到了每个 CUDA CTA 内。</p>
+  </section>
+
+  <section class="chapter"><h2>5. 64 线程如何算一个 Q·K</h2>
+    <p>线程 <code>dim</code> 只乘 Q[dim]×K[dim]，把结果写进 shared memory，再做树形 reduction：</p>
+    <pre><code>dot_products[dim] = query_value * key[cache_offset + dim];
+__syncthreads();
+
+for (int stride = 32; stride > 0; stride >>= 1) {
+    if (dim &lt; stride)
+        dot_products[dim] += dot_products[dim + stride];
+    __syncthreads();
+}
+score = dot_products[0] * scale;</code></pre>
+    <p>第一次把 64 个值合成 32 个，接着 16、8、4、2、1。v1 使用 shared memory 和全 CTA 同步，清晰但不快；后续可单独替换为 warp shuffle。</p>
+  </section>
+
+  <section class="chapter"><h2>6. Online Softmax：不保存完整 scores</h2>
+    <p>普通 softmax 需要先看到所有 scores 才知道最大值和分母。Online 版本扫描一个 score 就更新一次状态：</p>
+    <div class="formula">new_max = max(running_max, score)<br>alpha = exp(running_max − new_max)<br>beta = exp(score − new_max)<br><br>running_sum = running_sum × alpha + beta<br>output_acc = output_acc × alpha + beta × V[token]</div>
+    <div class="example"><div class="example-title">两步数值例子</div><p>第一个 score=2：max=2，sum=1，acc=V₀。</p><p>第二个 score=3：new_max=3，历史权重缩放为 <code>exp(2−3)=0.3679</code>；新 token 权重为 1。于是 sum=1.3679，acc=0.3679V₀+V₁。除以 sum 后与对 [2,3] 做普通 softmax 相同。</p></div>
+    <p>所有 running 状态和 V 累加使用 FP32，循环结束再转换到 FP16 输出。</p>
+  </section>
+
+  <section class="chapter"><h2>7. Python/C++/CUDA 三层入口</h2>
+    <div class="diagram"><div class="flow"><div class="node"><strong>Python</strong><small>paged_attention_cuda.py</small></div><div class="arrow">→</div><div class="node blue"><strong>PyTorch Binding</strong><small>shape/dtype/device 检查</small></div><div class="arrow">→</div><div class="node green"><strong>CUDA Kernel</strong><small>current stream</small></div></div></div>
+    <p>首次调用 <code>load_cuda_extension()</code> 会用 PyTorch JIT 编译三个 csrc 文件，产物放用户级 cache，并由 <code>@lru_cache(maxsize=1)</code> 保证进程内只加载一次。</p>
+    <h3>安全入口与热路径</h3><p>第 0 层使用安全入口，把小 metadata 同步到 CPU 验证有效 block ID；后续层复用同一 metadata，用 unchecked 入口跳过重复 CPU copy，但 C++ shape/dtype/device 检查仍保留。</p>
+  </section>
+
+  <section class="chapter"><h2>8. v1 的限制与 split-KV 实验</h2>
+    <div class="grid-2"><div class="card"><h3>v1 稳定路径</h3><ul><li>FP16</li><li>head_dim=64</li><li>query length=1</li><li>一个 CTA 串行扫描全部 tokens</li><li>GQA/MQA 和变长 batch</li></ul></div><div class="card"><h3>没有进入稳定 dispatch</h3><ul><li>half2 / 向量化 load</li><li>warp reduction</li><li>token 并行</li><li>自动选择 split-KV</li><li>通用 head_dim/dtype</li></ul></div></div>
+    <p>split-KV 实验把长序列拆给多个 CTA，再合并 online-softmax 状态。它在部分长序列可能有收益，但短序列的 partial/merge 开销明显，因此保留为实验而非自动 dispatch。</p>
+    <details class="quiz"><summary>检查：为什么不能对每个物理 block 单独 softmax 后再把输出相加？</summary><div class="answer">Softmax 分母必须覆盖整条逻辑序列。每块独立归一化会让每个块的概率都各自和为 1，改变块之间的相对权重。必须拼接 scores，或像 online softmax 一样正确合并 max/sum 状态。</div></details>
+    <a class="source-link" href="../../src/mini_llm_runtime/paged_attention.py">Python reference</a><a class="source-link" href="../../src/mini_llm_runtime/paged_attention_cuda.py">Python CUDA 入口</a><a class="source-link" href="../../csrc/paged_attention_cuda.cu">CUDA v1</a><a class="source-link" href="../split_kv_experiment.md">split-KV 记录</a>
+  </section>
+  <div class="pager"><a href="06-paged-kv.html"><small>上一页</small>← 06 · Paged KV</a><a href="08-scheduler.html"><small>下一页</small>08 · Scheduler →</a></div>
+</article></main></div><script src="assets/app.js"></script></body></html>

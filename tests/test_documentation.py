@@ -33,15 +33,16 @@ class LinkCollector(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.hrefs: list[str] = []
+        self.sources: list[str] = []
 
     def handle_starttag(
         self, tag: str, attrs: list[tuple[str, str | None]]
     ) -> None:
-        if tag != "a":
-            return
         for name, value in attrs:
-            if name == "href" and value is not None:
+            if tag in ("a", "link") and name == "href" and value is not None:
                 self.hrefs.append(value)
+            if tag == "script" and name == "src" and value is not None:
+                self.sources.append(value)
 
 
 def test_runtime_flow_links_exist_and_status_is_current() -> None:
@@ -65,3 +66,18 @@ def test_runtime_flow_links_exist_and_status_is_current() -> None:
     assert all(claim not in text for claim in stale_claims)
     assert "ContinuousBatchEngine" in text
     assert "../src/mini_llm_runtime/engine.py" in text
+
+
+def test_tutorial_local_links_and_scripts_exist() -> None:
+    """新教程作为 README 入口发布时，所有本地页面与源码路径必须有效。"""
+    pages = sorted((REPO_ROOT / "docs/tutorial").glob("*.html"))
+    assert len(pages) == 13
+    missing = []
+    for source in pages:
+        parser = LinkCollector()
+        parser.feed(source.read_text(encoding="utf-8"))
+        for target in parser.hrefs + parser.sources:
+            path = local_target(source, target)
+            if path is not None and not path.exists():
+                missing.append((source.name, target))
+    assert missing == []

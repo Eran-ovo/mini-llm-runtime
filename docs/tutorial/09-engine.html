@@ -1,0 +1,79 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>09 Continuous Engine · mini-vLLM</title><link rel="stylesheet" href="assets/style.css"></head>
+<body data-page="09-engine"><div class="layout"><main class="page"><article class="content">
+  <div class="crumb">Chapter 09 · Continuous Engine</div><h1>Engine 如何把所有组件串成闭环</h1><p class="lead"><code>ContinuousBatchEngine</code> 是整个项目的稳定顶层入口。它只有约两百行，却承担最容易出错的跨组件契约：顺序、事务、同步、结果归属和资源释放。</p>
+
+  <section class="chapter"><h2>1. 构造时先验证静态布局</h2>
+    <p>Engine 要求 Runner 使用 <code>paged_cuda</code> backend，并检查模型与 Cache storage 的：</p>
+    <div class="formula">num_layers<br>num_key_value_heads<br>head_dim<br>dtype<br>device</div>
+    <p>任一项不一致都提前报错。例如模型 K/V 有 2 heads，而 Cache 按 4 heads 分配，若不在构造时拒绝，后面写地址可能 shape 错误甚至越界。</p>
+  </section>
+
+  <section class="chapter"><h2>2. submit() 同时做两件事</h2>
+    <pre><code>arrival_ns = clock_ns()
+request = scheduler.submit(
+    request_id,
+    prompt_token_ids,
+    max_new_tokens=max_new_tokens,
+    eos_token_ids=eos_token_ids,
+)
+metrics.register_request(request_id, arrival_ns)</code></pre>
+    <p>请求必须通过 Engine 提交，而不是直接调用 Scheduler，否则 metrics 不知道 arrival 时间，后续无法计算 queue wait 和 TTFT。</p>
+  </section>
+
+  <section class="chapter"><h2>3. step() 的完整时序</h2>
+    <div class="steps"><div class="step"><div><b>记录 started_ns</b><p>同一个单调时钟用于所有请求事件。</p></div></div><div class="step"><div><b>scheduler.schedule_step()</b><p>返回 mixed batch 或 None。None 可能表示没有工作，也可能表示等待资源。</p></div></div><div class="step"><div><b>逐请求 Prefill</b><p>为每个新请求构造 <code>[1,S]</code> tensor 和 <code>PagedRequestKVCache</code>。</p></div></div><div class="step"><div><b>一次 batched Decode</b><p>把已有请求的 token 堆成 <code>[B,1]</code>，用 <code>PagedBatchDecodeAdapter</code> 执行。</p></div></div><div class="step"><div><b>按 batch.items 顺序拼 token</b><p>Prefill/Decode 执行顺序可能与逻辑 items 不同，必须按 ID 恢复。</p></div></div><div class="step"><div><b>一次 D2H</b><p><code>torch.cat(...).cpu().tolist()</code>，而不是每请求 <code>.item()</code>。</p></div></div><div class="step"><div><b>apply + release + metrics</b><p>Scheduler 更新请求，Admission 释放 finished blocks，记录 token ready/completed。</p></div></div></div>
+  </section>
+
+  <section class="chapter"><h2>4. Mixed Batch 为什么要拆开执行</h2>
+    <p>SchedulerBatch 可以同时包含新请求 Prefill 和旧请求 Decode，但它们的输入形状与 attention 语义不同：</p>
+    <table class="compare-table"><thead><tr><th></th><th>Prefill 子批</th><th>Decode 子批</th></tr></thead><tbody><tr><td>输入长度</td><td>每请求不同，当前逐请求执行</td><td>每请求恰好 1</td></tr><tr><td>mask</td><td>causal mask</td><td>无需显式 mask</td></tr><tr><td>Cache</td><td>空 Cache 初始化</td><td>已有变长 Cache 追加</td></tr><tr><td>当前实现</td><td>N 次 runner.prefill</td><td>1 次 runner.decode_batch</td></tr></tbody></table>
+    <div class="callout warn"><div class="icon">!</div><p>这意味着 mixed step 中，新请求的长 Prefill 会先执行，已有请求的 Decode 要等待，形成 Prefill/Decode interference。Continuous 提升整体排队与吞吐，但可能拉长某个 TPOT interval。</p></div>
+  </section>
+
+  <section class="chapter"><h2>5. PagedBatchDecodeAdapter 做了什么</h2>
+    <p>它把多个独立 RequestBlockTable 包装成 ModelRunner 认识的“批量 Cache”。最重要的契约是 batch row 顺序。</p>
+    <pre><code>request_ids = ("C", "A", "B")
+
+row 0: token_C, position_C, K/V_C, table_C, length_C
+row 1: token_A, position_A, K/V_A, table_A, length_A
+row 2: token_B, position_B, K/V_B, table_B, length_B</code></pre>
+    <p>如果某处偷偷按 request 创建顺序 A/B/C 构造 metadata，所有 tensor 的 shape 都合法，CUDA 也可能不报错，但不同用户上下文会串行——这是最危险的一类 silent corruption。</p>
+    <h3>批量事务</h3>
+    <p><code>begin_decode()</code> 逐请求 begin append。若后面的请求分配失败，会逆序 abort 前面已经 begin 的请求。所有层写完后才统一 commit。</p>
+  </section>
+
+  <section class="chapter"><h2>6. 为什么 Prefill 必须先于 Decode</h2>
+    <p>当前排序是为了可重试语义：</p>
+    <pre><code>try:
+    run_all_new_prefills()       # 结果暂不 apply
+    run_one_batched_decode()     # 内部自带 batch transaction
+except Exception:
+    admission.release_admitted(prefill_ids)
+    scheduler.abort_step()
+    raise</code></pre>
+    <p>如果先成功提交旧请求 Decode，再执行新 Prefill，而 Prefill 随后失败，旧请求 Cache 已推进，Scheduler 却没 apply，无法原样重试。先 Prefill、最后事务式 Decode，可以在异常时让整个 step 回到开始前。</p>
+  </section>
+
+  <section class="chapter"><h2>7. 一次 D2H 同步的意义</h2>
+    <p>EOS/max tokens 判断发生在 CPU Scheduler，因此 token 必须回 CPU。逐请求调用 <code>.item()</code> 会造成 B 次 GPU 同步。Engine 先在 GPU 收集所有 argmax，最后只做一次：</p>
+    <pre><code>ordered_gpu_tokens = torch.cat([
+    selected_tokens[item.request_id]
+    for item in batch.items
+])
+ordered_cpu_tokens = ordered_gpu_tokens.cpu().tolist()</code></pre>
+    <p>这是每 step 的同步屏障。当前同步 Engine 不尝试用 stream/event 双缓冲隐藏它。</p>
+  </section>
+
+  <section class="chapter"><h2>8. 请求指标在哪些边界记录</h2>
+    <div class="timeline"><div class="tick"><div class="tick-name">ARRIVAL</div><div class="tick-body"><span class="work prefill">engine.submit</span></div></div><div class="tick"><div class="tick-name">PREFILL</div><div class="tick-body"><span class="work prefill">record_prefill_started</span></div></div><div class="tick"><div class="tick-name">TOKEN READY</div><div class="tick-body"><span class="work decode">D2H 完成 · record_tokens</span></div></div><div class="tick"><div class="tick-name">COMPLETED</div><div class="tick-body"><span class="work decode">apply + release 完成</span></div></div></div>
+    <p>用户可见 E2E 截止到最后 token ready，不把 block 清理混进去；清理时间单独叫 post-token completion。</p>
+  </section>
+
+  <section class="chapter"><h2>9. NVTX 标记与 profiler 边界</h2>
+    <p><code>enable_nvtx=True</code> 时，Engine 为 schedule、整个 step、每个 Prefill、batched Decode、D2H 和 apply/release 推入 NVTX range。上下文管理器的 <code>finally</code> 确保异常也 pop。</p>
+    <div class="callout danger"><div class="icon">×</div><p>现有 WSL2 + Nsight Systems 2023.4 证据只确认 host 编排顺序，没有 GPU kernel timeline。因此不能声称观察到了 kernel overlap、SM 利用率或真实 device idle。</p></div>
+    <details class="quiz"><summary>检查：Engine 为什么不负责 tokenizer.decode()？</summary><div class="answer">稳定 runtime 的输入输出契约是 token IDs。Tokenizer 属于模型边界/服务层，放在 Engine 内会把文本库、batch 编码和流式输出策略混入核心调度与执行逻辑。</div></details>
+    <a class="source-link" href="../../src/mini_llm_runtime/engine.py">engine.py</a><a class="source-link" href="../../src/mini_llm_runtime/paged_batch.py">paged_batch.py</a><a class="source-link" href="../../src/mini_llm_runtime/request_metrics.py">request_metrics.py</a><a class="source-link" href="../continuous_batch_engine.md">Engine 设计记录</a>
+  </section>
+  <div class="pager"><a href="08-scheduler.html"><small>上一页</small>← 08 · Scheduler</a><a href="10-testing.html"><small>下一页</small>10 · 测试与 Benchmark →</a></div>
+</article></main></div><script src="assets/app.js"></script></body></html>

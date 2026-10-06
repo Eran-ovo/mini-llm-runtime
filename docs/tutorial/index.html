@@ -1,0 +1,45 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>mini-vLLM 从零到源码教程</title><link rel="stylesheet" href="assets/style.css"></head>
+<body data-page="index"><div class="layout"><main class="page"><article class="content">
+  <div class="crumb">Mini LLM Runtime · Beginner to Source</div>
+  <h1>从零开始，读懂一个 mini-vLLM</h1>
+  <p class="lead">这套教程面向第一次接触大模型推理系统的人。我们不假设你理解 Transformer、CUDA 或调度器；会从“文本为什么会变成数字”讲起，最后一直走到 <code>engine.py</code>、Paged KV Cache 和 CUDA kernel 的具体实现。</p>
+  <div class="hero-meta"><span class="pill">13 个页面</span><span class="pill">对应 v1.1.0 核心源码</span><span class="pill">Qwen2.5-0.5B · 单 GPU</span><span class="pill">源码可点击</span></div>
+
+  <section class="chapter"><h2>先看最终答案：这个项目做什么？</h2>
+    <p>用户给出一句话，例如“请解释 KV Cache”。Tokenizer 把文字变成 token ID；Engine 把请求交给 Scheduler；Scheduler 决定本轮哪些请求运行；ModelRunner 在 GPU 上执行 Qwen；KV Cache 保存历史注意力需要的 K/V；最后 logits 选出下一个 token。不断重复，直到 EOS 或达到生成上限。</p>
+    <div class="diagram"><div class="flow"><div class="node"><strong>文本</strong><small>"你好"</small></div><div class="arrow">→</div><div class="node blue"><strong>Tokenizer</strong><small>[108386, 1773]</small></div><div class="arrow">→</div><div class="node green"><strong>Engine</strong><small>schedule + execute</small></div><div class="arrow">→</div><div class="node orange"><strong>GPU Qwen</strong><small>logits</small></div><div class="arrow">→</div><div class="node"><strong>下一个 token</strong><small>argmax</small></div></div></div>
+    <div class="callout good"><div class="icon">✓</div><p><strong>项目定位：</strong>它不是生产版 vLLM 的复制品，而是一个教学型、单 GPU、同步、greedy 推理引擎。它把 vLLM 最关键的概念拆成可验证的小步骤。</p></div>
+  </section>
+
+  <section class="chapter"><h2>推荐学习路线</h2>
+    <div class="grid-3">
+      <div class="card"><span class="label">阶段 A · 建立语言</span><h3>01–02</h3><p>理解 token、tensor、logits、Prefill/Decode，再认识仓库目录和四个核心组件。</p></div>
+      <div class="card"><span class="label">阶段 B · 模型计算</span><h3>03–04</h3><p>看配置与 safetensors 如何变成权重对象，再逐行理解 Qwen Decoder。</p></div>
+      <div class="card"><span class="label">阶段 C · 显存核心</span><h3>05–07</h3><p>从连续 KV Cache 过渡到分页存储，最后进入 CUDA Paged Attention。</p></div>
+      <div class="card"><span class="label">阶段 D · 服务系统</span><h3>08–09</h3><p>理解请求状态机、Continuous Batching 以及 Engine 如何串起全部组件。</p></div>
+      <div class="card"><span class="label">阶段 E · 证据</span><h3>10</h3><p>学会区分 correctness、benchmark、profiler 与 release evidence。</p></div>
+      <div class="card"><span class="label">阶段 F · 动手</span><h3>11 + 附录</h3><p>按一条真实请求跟读源码，用检查题确认自己是否真正掌握。</p></div>
+    </div>
+  </section>
+
+  <section class="chapter"><h2>学习时始终记住的四个问题</h2>
+    <div class="steps">
+      <div class="step"><div><b>这一段代码属于控制面、计算面，还是存储面？</b><p>Scheduler 是控制面；ModelRunner/CUDA 是计算面；KV Cache Manager 是存储面；Engine 是编排层。</p></div></div>
+      <div class="step"><div><b>这个 tensor 的 shape 是什么？每个维度代表什么？</b><p>大多数模型 bug 都不是公式不会，而是 batch、head、sequence、head_dim 的顺序错了。</p></div></div>
+      <div class="step"><div><b>当前 token 已经“写入”，还是已经“可见”？</b><p>事务把物理写入和逻辑可见性分开；pending 数据只有 commit 后才成为正式历史。</p></div></div>
+      <div class="step"><div><b>这是正确性实现还是性能实现？</b><p>Python reference 可以慢但清晰；CUDA kernel 才承担热路径。不能拿 reference 的速度评价设计。</p></div></div>
+    </div>
+  </section>
+
+  <section class="chapter"><h2>怎么打开和使用</h2>
+    <pre><code># 方式 1：直接打开首页
+xdg-open /home/eran/mini-llm-runtime/docs/tutorial/index.html
+
+# 方式 2：启动本地静态服务器
+cd /home/eran/mini-llm-runtime
+python3 -m http.server 8000
+# 浏览器访问 http://localhost:8000/docs/tutorial/</code></pre>
+    <p class="muted small">左侧目录可以在页面之间跳转。手机或窄窗口使用顶部“目录”按钮。每页末尾都有上一页/下一页。</p>
+  </section>
+  <div class="pager"><a href="../vllm_runtime_flow.html"><small>已有内容</small>单页架构总览</a><a href="01-foundations.html"><small>下一页</small>01 · 零基础概念 →</a></div>
+</article></main></div><script src="assets/app.js"></script></body></html>

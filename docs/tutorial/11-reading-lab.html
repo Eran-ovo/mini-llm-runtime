@@ -1,0 +1,104 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>11 源码阅读实战 · mini-vLLM</title><link rel="stylesheet" href="assets/style.css"></head>
+<body data-page="11-reading-lab"><div class="layout"><main class="page"><article class="content">
+  <div class="crumb">Chapter 11 · Reading Lab</div><h1>带着两个请求，完整跟一遍源码</h1><p class="lead">现在把前面知识合起来。我们构造两个小请求 A/B，沿着真实类和方法走完提交、Prefill、Decode、完成与 block 复用。</p>
+
+  <section class="chapter"><h2>0. 假设配置</h2>
+    <pre><code>block_size = 3
+total_blocks = 6
+max_running_requests = 2
+max_batch_tokens = 6
+
+A: prompt=(10,11,12), max_new_tokens=3
+B: prompt=(20,21),    max_new_tokens=2</code></pre>
+    <p>A 最大 Cache tokens = 3+3−1=5，需要 2 blocks。B 最大 Cache tokens = 2+2−1=3，需要 1 block。</p>
+  </section>
+
+  <section class="chapter"><h2>1. 启动阶段：创建五个对象</h2>
+    <pre><code># 伪代码：参数省略
+config, weights = load_qwen_checkpoint(model_dir, device="cuda", dtype=float16)
+runner = QwenPrefillRunner(config, weights, decode_attention_backend="paged_cuda")
+manager = PagedKVCacheManager(total_blocks=6, block_size=3, ...)
+admission = PagedBlockAdmissionController(manager)
+scheduler = RequestScheduler(
+    max_running_requests=2,
+    max_batch_tokens=6,
+    admission_callback=admission.try_admit,
+)
+engine = ContinuousBatchEngine(
+    scheduler=scheduler,
+    runner=runner,
+    admission=admission,
+)</code></pre>
+    <p>依赖方向很重要：Manager 先存在；Admission 包装 Manager；Scheduler 持有 Admission callback；Engine 同时持有 Scheduler、Runner、Admission。</p>
+  </section>
+
+  <section class="chapter"><h2>2. 提交 A 和 B</h2>
+    <pre><code>engine.submit("A", (10,11,12), max_new_tokens=3)
+engine.submit("B", (20,21), max_new_tokens=2)</code></pre>
+    <div class="stack"><div class="stack-row"><strong>Metrics</strong>记录 A/B 各自 arrival_ns。</div><div class="stack-row"><strong>Scheduler</strong>创建 RequestState，arrival_index 分别 0/1。</div><div class="stack-row"><strong>Waiting queue</strong><code>[A, B]</code>。</div><div class="stack-row"><strong>Manager</strong>此时还没有请求，也没有 block 被占用。</div></div>
+  </section>
+
+  <section class="chapter"><h2>3. engine.step()：Scheduler 组成 step 0</h2>
+    <p>目前没有 running，所以没有 Decode。开始按 FIFO 接纳 Prefill：</p>
+    <div class="steps"><div class="step"><div><b>接纳 A</b><p>cost=3，budget 足够；Admission 创建 table A，预留 2 blocks，例如 [0,1]。</p></div></div><div class="step"><div><b>接纳 B</b><p>累计 cost=5≤6；Admission 创建 table B，预留 1 block，例如 [2]。</p></div></div><div class="step"><div><b>产生 batch</b><p><code>items=[A PREFILL(10,11,12), B PREFILL(20,21)]</code>。</p></div></div></div>
+    <div class="memory"><div class="block"><div class="block-name">block 0 · A</div><div class="slots"><span class="slot">·</span><span class="slot">·</span><span class="slot">·</span></div></div><div class="block"><div class="block-name">block 1 · A future</div><div class="slots"><span class="slot">·</span><span class="slot">·</span><span class="slot">·</span></div></div><div class="block"><div class="block-name">block 2 · B</div><div class="slots"><span class="slot">·</span><span class="slot">·</span><span class="slot">·</span></div></div></div>
+  </section>
+
+  <section class="chapter"><h2>4. Engine 逐请求 Prefill</h2>
+    <p>Engine 遍历 batch.items 中的 Prefill 项。以 A 为例：</p>
+    <pre><code>input_ids = tensor([[10,11,12]], device="cuda")
+cache = PagedRequestKVCache(manager, "A")
+output = runner.prefill(input_ids, cache=cache)
+selected_tokens["A"] = output.logits[:, -1].argmax(-1)</code></pre>
+    <div class="steps"><div class="step"><div><b>cache.begin_append(3)</b><p>A 已预留 blocks，所以不会新分配；pending=[0,3)。</p></div></div><div class="step"><div><b>每层 Q/K/V + RoPE</b><p>write_layer 把这一层 3 个 K/V 写入 physical block 0 的 offsets 0,1,2。</p></div></div><div class="step"><div><b>24 层写完 commit</b><p>A table.token_count 从 0 变 3。</p></div></div><div class="step"><div><b>LM Head + argmax</b><p>假设 A 首 token=100。B 同理写 block 2 offsets 0,1，首 token=200。</p></div></div></div>
+    <div class="memory"><div class="block"><div class="block-name">block 0 · A</div><div class="slots"><span class="slot used">10</span><span class="slot used">11</span><span class="slot used">12</span></div></div><div class="block"><div class="block-name">block 1 · A future</div><div class="slots"><span class="slot">·</span><span class="slot">·</span><span class="slot">·</span></div></div><div class="block"><div class="block-name">block 2 · B</div><div class="slots"><span class="slot used">20</span><span class="slot used">21</span><span class="slot">·</span></div></div></div>
+  </section>
+
+  <section class="chapter"><h2>5. step 0 结果回写</h2>
+    <p>Engine 按 batch.items 原顺序拼接 GPU tokens，单次 D2H 得到 <code>[100,200]</code>，构造：</p>
+    <pre><code>generated = {"A": 100, "B": 200}
+update = scheduler.apply_step_results(generated)</code></pre>
+    <p>A/B 都把 <code>prefilled=True</code>，generated 分别为 [100]/[200]。尚未达到 max_new_tokens，也没有 EOS，所以都留在 RUNNING。</p>
+  </section>
+
+  <section class="chapter"><h2>6. step 1：真正的 Batched Decode</h2>
+    <p>Scheduler 为每个 running 请求取最后生成 token：</p>
+    <pre><code>items = [
+  A DECODE input=(100,),
+  B DECODE input=(200,),
+]
+token_ids = tensor([[100], [200]])  # [B=2,1]
+adapter = PagedBatchDecodeAdapter(manager, ("A","B"))</code></pre>
+    <h3>位置与可读长度</h3>
+    <table class="compare-table"><thead><tr><th>请求</th><th>旧 token_count</th><th>RoPE position</th><th>begin 后 Attention length</th></tr></thead><tbody><tr><td>A</td><td>3</td><td>3</td><td>4</td></tr><tr><td>B</td><td>2</td><td>2</td><td>3</td></tr></tbody></table>
+    <p>A 的 token 100 写入 block 1 offset 0（跨块）；B 的 token 200 写入 block 2 offset 2（仍在块内）。</p>
+    <pre><code>block_table = [[0,1],
+               [2,-1]]
+sequence_lengths = [4,3]
+position_ids = [[3], [2]]</code></pre>
+  </section>
+
+  <section class="chapter"><h2>7. 每个 Decoder layer 内发生什么</h2>
+    <div class="steps"><div class="step"><div><b>对 [2,1,H] 做 batched projection</b><p>Q/K/V、RMSNorm、MLP 都共享 batch 维计算。</p></div></div><div class="step"><div><b>Adapter.write_layer</b><p>把 row 0 K/V 写 A pending slot，row 1 写 B pending slot。</p></div></div><div class="step"><div><b>一次 CUDA launch</b><p>query shape [2,Hq,D]，同一个物理 pool，不同 table rows/lengths。</p></div></div><div class="step"><div><b>重复 24 层</b><p>metadata 在本 step 层间复用，不重复构造。</p></div></div><div class="step"><div><b>LM Head 成功后 commit_decode</b><p>A/B token_count 同时推进为 4/3。</p></div></div></div>
+  </section>
+
+  <section class="chapter"><h2>8. B 完成并释放</h2>
+    <p>假设 step 1 输出 A=101、B=201。B 已生成两个 token [200,201]，达到 max_new_tokens=2。Scheduler 标记 B FINISHED，并返回 <code>finished_request_ids=("B",)</code>。</p>
+    <pre><code>released = admission.release_finished(("B",))
+# manager.release_request("B")
+# table B 释放 block [2]
+# allocator free list 重新包含 2</code></pre>
+    <div class="memory"><div class="block"><div class="block-name">block 0 · A</div><div class="slots"><span class="slot used">10</span><span class="slot used">11</span><span class="slot used">12</span></div></div><div class="block"><div class="block-name">block 1 · A</div><div class="slots"><span class="slot used">100</span><span class="slot">·</span><span class="slot">·</span></div></div><div class="block"><div class="block-name">block 2 · FREE</div><div class="slots"><span class="slot">old</span><span class="slot">old</span><span class="slot">old</span></div></div></div>
+    <p>block 2 的旧字节可能还在，但所有权已释放、B table 已删除，因此不可见。新请求可以拿到 block 2 并覆盖。</p>
+  </section>
+
+  <section class="chapter"><h2>9. 如果 step 1 第 17 层 CUDA 失败</h2>
+    <div class="stack"><div class="stack-row"><strong>Adapter</strong>abort A/B pending；已写层字节不可见，token_count 回到 3/2。</div><div class="stack-row"><strong>Engine</strong>本 step 没有新 Prefill reservation，无需释放新请求。</div><div class="stack-row"><strong>Scheduler</strong>abort outstanding；A/B generated 仍是 [100]/[200]，step index 不前进。</div><div class="stack-row"><strong>下次 step</strong>仍用 token 100/200 重试相同 Decode。</div></div>
+  </section>
+
+  <section class="chapter"><h2>10. 建议实际跟读顺序</h2>
+    <ol><li>在 <a href="../../src/mini_llm_runtime/engine.py">engine.py</a> 从 <code>step()</code> 进入 <code>_execute_batch()</code>。</li><li>Prefill 分支跳到 <a href="../../src/mini_llm_runtime/qwen_model_runner.py">qwen_model_runner.py</a> 的 <code>prefill()</code>。</li><li>Decode 分支先看 <a href="../../src/mini_llm_runtime/paged_batch.py">paged_batch.py</a>，再看 <code>decode_batch()</code>。</li><li>在 <code>_attention()</code> 追到 <a href="../../src/mini_llm_runtime/paged_attention_cuda.py">paged_attention_cuda.py</a>。</li><li>最后进入 <a href="../../csrc/paged_attention_cuda.cu">paged_attention_cuda.cu</a>。</li><li>回到 Engine 看 D2H、apply 与 release。</li></ol>
+    <details class="quiz"><summary>毕业检查：请解释“写入当前 K/V 后，position=3 但 sequence_length=4”</summary><div class="answer">RoPE position 表示当前 token 在序列中的零基绝对位置，等于追加前历史长度 3。Attention sequence_length 表示当前 Query 可以读取多少个 K/V，写入当前 token 后包含历史 3 个加自己 1 个，所以是 4。</div></details>
+  </section>
+  <div class="pager"><a href="10-testing.html"><small>上一页</small>← 10 · 测试与 Benchmark</a><a href="glossary.html"><small>下一页</small>附录 · 术语表 →</a></div>
+</article></main></div><script src="assets/app.js"></script></body></html>

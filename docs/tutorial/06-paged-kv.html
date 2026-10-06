@@ -1,0 +1,70 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>06 Paged KV Cache · mini-vLLM</title><link rel="stylesheet" href="assets/style.css"></head>
+<body data-page="06-paged-kv"><div class="layout"><main class="page"><article class="content">
+  <div class="crumb">Chapter 06 · Paged KV</div><h1>把连续 Cache 拆成可复用的物理块</h1><p class="lead">Paged KV 的核心不是“把 tensor 切小”这么简单，而是分离逻辑 token 顺序与物理显存位置，并让 allocator、request table、storage 和 transaction 各自守住职责。</p>
+
+  <section class="chapter"><h2>1. 连续预留为什么浪费</h2>
+    <p>如果每个请求都预留最大长度 2048，但大多数只用几十个 token，显存会被空槽占住。分页策略用固定大小 block，按请求实际需要分配。</p>
+    <div class="grid-2"><div class="card"><span class="label">连续预留</span><h3>每请求一大段</h3><div class="memory"><div class="block" style="min-width:250px"><div class="block-name">Request A · capacity 12</div><div class="slots"><span class="slot used">A0</span><span class="slot used">A1</span><span class="slot">·</span><span class="slot">·</span><span class="slot">·</span><span class="slot">·</span></div></div></div><p>请求结束前，未用空间也不能给别人。</p></div><div class="card"><span class="label">Paged</span><h3>按 block 组合</h3><div class="memory"><div class="block"><div class="block-name">block 2</div><div class="slots"><span class="slot used">A0</span><span class="slot used">A1</span><span class="slot">·</span></div></div><div class="block"><div class="block-name">block 4</div><div class="slots"><span class="slot used">B0</span><span class="slot used">B1</span><span class="slot used">B2</span></div></div></div><p>请求只持有所需块，结束后整块复用。</p></div></div>
+  </section>
+
+  <section class="chapter"><h2>2. 三层数据结构</h2>
+    <div class="stack"><div class="stack-row"><strong>FixedBlockAllocator</strong>只管理整数 block ID：free list + allocated set；不持有 tensor。</div><div class="stack-row"><strong>RequestBlockTable</strong>保存某请求的逻辑 block → 物理 block 映射，以及 token_count/pending。</div><div class="stack-row"><strong>PagedKVStorage</strong>真正预分配 GPU K/V tensor，并按 table 提供的地址写入。</div><div class="stack-row"><strong>PagedKVCacheManager</strong>统一拥有以上对象和 request registry，对 Scheduler/Engine 提供稳定 API。</div></div>
+    <div class="formula">storage shape = [layer, physical_block, kv_head, block_offset, head_dim]</div>
+  </section>
+
+  <section class="chapter"><h2>3. 逻辑 token 如何找到物理地址</h2>
+    <p>设 <code>block_size=3</code>，请求 A 的 block table 为 <code>[2,0,5]</code>。</p>
+    <div class="formula">logical_block = token_index // block_size<br>block_offset = token_index % block_size<br>physical_block = block_table[logical_block]</div>
+    <div class="example"><div class="example-title">查 token 4</div><p><code>4 // 3 = 1</code>，所以查 table[1]，得到 physical block 0；<code>4 % 3 = 1</code>，所以在 block 0 的 offset 1。</p></div>
+    <div class="memory"><div class="block"><div class="block-name">physical 0</div><div class="slots"><span class="slot used">t3</span><span class="slot now">t4</span><span class="slot used">t5</span></div></div><div class="block"><div class="block-name">physical 1</div><div class="slots"><span class="slot">·</span><span class="slot">·</span><span class="slot">·</span></div></div><div class="block"><div class="block-name">physical 2</div><div class="slots"><span class="slot used">t0</span><span class="slot used">t1</span><span class="slot used">t2</span></div></div><div class="block"><div class="block-name">physical 5</div><div class="slots"><span class="slot used">t6</span><span class="slot used">t7</span><span class="slot">·</span></div></div></div>
+    <p>逻辑上 token 2→3 连续，物理上却从 block 2 跳到 block 0。Paged Attention 的职责就是按 table 保持正确逻辑顺序。</p>
+  </section>
+
+  <section class="chapter"><h2>4. Allocator 如何保证原子分配</h2>
+    <pre><code>def allocate(self, block_count):
+    if block_count > self.free_count:
+        raise BlockPoolExhaustedError(...)
+    block_ids = tuple(self._free_block_ids.pop()
+                      for _ in range(block_count))
+    self._allocated_block_ids.update(block_ids)
+    return block_ids</code></pre>
+    <p>先检查容量，再 pop，所以 OOM 时 free list 完全不变。释放也先验证所有 ID 合法、没有重复且确实 allocated，之后才批量修改，避免“释放一半后报错”。</p>
+  </section>
+
+  <section class="chapter"><h2>5. RequestBlockTable 的增长事务</h2>
+    <div class="steps"><div class="step"><div><b>计算新 token_count</b><p><code>new = current + append</code>，据此向上取整需要多少 blocks。</p></div></div><div class="step"><div><b>只申请差额</b><p><code>additional = required_blocks - current_blocks</code>。块内还有余量时不会分配。</p></div></div><div class="step"><div><b>记录 new_block_ids</b><p>pending 保存本次新申请的后缀。abort 时只释放它们，不动历史 blocks。</p></div></div><div class="step"><div><b>commit token_count</b><p>成功后才把 pending.end 设为正式 token_count。</p></div></div></div>
+    <div class="example"><div class="example-title">跨块增长</div><p>block_size=3，当前 token_count=3，已有 block [2]。append 1 后需要 2 个块，新申请 [0]，table 变 [2,0]，pending=[3,4)。若失败，abort 删除后缀 [0] 并归还 allocator，table 回到 [2]。</p></div>
+  </section>
+
+  <section class="chapter"><h2>6. Storage 如何写跨块 token</h2>
+    <pre><code>for relative_index in range(pending.token_count):
+    logical_index = pending.start + relative_index
+    location = table.locate(logical_index, include_pending=True)
+    self.key[layer, location.block_id, :, location.block_offset, :].copy_(
+        key[:, relative_index, :]
+    )</code></pre>
+    <p>实现为清晰而逐 token copy，主要用来固定地址语义。Decode CUDA kernel 的读取则直接在设备端做相同的整数映射，不先 gather。</p>
+  </section>
+
+  <section class="chapter"><h2>7. Batch Metadata 为什么要 padding</h2>
+    <p>GPU tensor 必须是矩形，但请求 block 数不同。假设：</p>
+    <pre><code>A: blocks [2, 4, 5], length 7
+B: blocks [0, 6],    length 4
+C: blocks [1, 3],    length 6
+
+block_table = [[2,4,5],
+               [0,6,-1],
+               [1,3,-1]]
+sequence_lengths = [7,4,6]</code></pre>
+    <p><code>-1</code> 只是 padding，kernel 必须用 sequence length 算出真正要读的 block 数，不能扫描整行宽度。完整生命周期预留时，行尾也可能是合法但尚未使用的未来 blocks，仍不能提前读取。</p>
+  </section>
+
+  <section class="chapter"><h2>8. 当前 Admission 为什么保守预留全部 blocks</h2>
+    <p><code>PagedBlockAdmissionController</code> 在接纳请求时按 <code>prompt + max_new − 1</code> 一次预留，保证 Decode 中途不会 OOM。代价是并发数比按需增长更保守。</p>
+    <div class="formula">required_blocks = ceil(max_cache_tokens / block_size)</div>
+    <div class="callout warn"><div class="icon">↔</div><p>这是没有 preemption 时的正确性/利用率取舍。真正的生产引擎可以按需增长，在压力下抢占或换出请求；本项目明确没有实现这些机制。</p></div>
+    <details class="quiz"><summary>检查：为什么 GPU storage 初始化时已经分配全部 blocks，admission 还要“分配 block”？</summary><div class="answer">GPU tensor 的总物理池已经存在；allocator 分配的是这些槽位的所有权 ID。它不再次申请 CUDA memory，而是保证两个活跃请求不会写同一个物理 block。</div></details>
+    <a class="source-link" href="../../src/mini_llm_runtime/paged_kv_cache.py">paged_kv_cache.py</a><a class="source-link" href="../../src/mini_llm_runtime/paged_kv_manager.py">paged_kv_manager.py</a><a class="source-link" href="../../src/mini_llm_runtime/block_admission.py">block_admission.py</a>
+  </section>
+  <div class="pager"><a href="05-kv-cache.html"><small>上一页</small>← 05 · KV Cache</a><a href="07-paged-attention.html"><small>下一页</small>07 · CUDA Paged Attention →</a></div>
+</article></main></div><script src="assets/app.js"></script></body></html>

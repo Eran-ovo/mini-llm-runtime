@@ -1,0 +1,72 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>08 Scheduler · mini-vLLM</title><link rel="stylesheet" href="assets/style.css"></head>
+<body data-page="08-scheduler"><div class="layout"><main class="page"><article class="content">
+  <div class="crumb">Chapter 08 · Scheduler</div><h1>Scheduler：每一步到底算谁</h1><p class="lead">Scheduler 是纯 CPU 控制面。它不执行模型、不持有 GPU tensor，也不释放显存；它只维护请求状态，并生成一个确定性的工作清单。</p>
+
+  <section class="chapter"><h2>1. 请求状态机</h2>
+    <div class="diagram"><div class="flow"><div class="node"><strong>WAITING</strong><small>等待接纳</small></div><div class="arrow">→</div><div class="node green"><strong>RUNNING</strong><small>已 Prefill/持续 Decode</small></div><div class="arrow">→</div><div class="node orange"><strong>FINISHED</strong><small>EOS / max tokens</small></div></div></div>
+    <p><code>RequestState</code> 保存：</p>
+    <pre><code>request_id
+prompt_token_ids
+max_new_tokens
+eos_token_ids
+arrival_index
+status / prefilled / finish_reason
+generated_token_ids</code></pre>
+    <p>它的 <code>max_cache_tokens</code> 属性返回 <code>prompt + max_new − 1</code>，供 Admission 计算最大 block 数。</p>
+  </section>
+
+  <section class="chapter"><h2>2. SchedulerBatch 的每一项</h2>
+    <p><code>ScheduledRequest</code> 只有 request ID、工作类型和本次输入 token IDs：</p>
+    <table class="compare-table"><thead><tr><th>WorkKind</th><th>input_token_ids</th><th>token_cost</th></tr></thead><tbody><tr><td>PREFILL</td><td>整个 prompt</td><td>prompt length</td></tr><tr><td>DECODE</td><td>上一步生成的最后 1 token</td><td>1</td></tr></tbody></table>
+    <p>Scheduler 不生成 GPU tensor。这一步由 Engine 完成，所以调度策略可以在没有 CUDA 的测试里运行。</p>
+  </section>
+
+  <section class="chapter"><h2>3. schedule_step() 精确算法</h2>
+    <div class="steps"><div class="step"><div><b>检查 outstanding batch</b><p>上一次 schedule 后必须先 apply 或 abort，防止同一请求被重复送进 GPU。</p></div></div><div class="step"><div><b>冻结 running_at_step_start</b><p>Static policy 是否允许 refill，必须看 step 开始时是否已有 cohort。</p></div></div><div class="step"><div><b>先加入所有 running Decode</b><p>每个成本 1，Decode priority 降低已有请求的 TPOT 抖动。</p></div></div><div class="step"><div><b>算剩余 request slots</b><p><code>max_running_requests − len(running)</code>。</p></div></div><div class="step"><div><b>按 FIFO 查看 waiting 队首</b><p>检查总 token budget、mixed prefill budget 和 Admission blocks。</p></div></div><div class="step"><div><b>产生 outstanding SchedulerBatch</b><p>保存 step index，在 apply 前禁止产生下一批。</p></div></div></div>
+    <div class="formula">batch token cost = running request count + Σ(admitted prompt lengths)</div>
+  </section>
+
+  <section class="chapter"><h2>4. 一个具体调度例子</h2>
+    <p>参数：<code>max_running_requests=2</code>，<code>max_batch_tokens=5</code>。A prompt 长 3、生成 3；B prompt 长 2、生成 2；C prompt 长 3、生成 2。</p>
+    <div class="timeline"><div class="tick"><div class="tick-name">STEP 0</div><div class="tick-body"><span class="work prefill">A PREFILL ·3</span><span class="work prefill">B PREFILL ·2</span></div></div><div class="tick"><div class="tick-name">STEP 1</div><div class="tick-body"><span class="work decode">A DECODE ·1</span><span class="work decode">B DECODE ·1</span></div></div><div class="tick"><div class="tick-name">STEP 2</div><div class="tick-body"><span class="work decode">A DECODE ·1</span><span class="work prefill">C PREFILL ·3</span></div></div><div class="tick"><div class="tick-name">STEP 3</div><div class="tick-body"><span class="work decode">C DECODE ·1</span></div></div></div>
+    <p>假设 B 在 step 1 完成，step 2 就腾出一个 slot；Continuous policy 让 C 立即加入。总成本 1+3=4，没有超过 5。</p>
+  </section>
+
+  <section class="chapter"><h2>5. strict FIFO 与 whole Prefill</h2>
+    <div class="example"><div class="example-title">队首 A 长 5，后面 B 长 1，但本 step 只剩 3 token budget</div><p>Scheduler 停止接纳，不能跳过 A 选择 B。因为它不支持 chunked prefill，也选择 strict FIFO 保证到达顺序公平。</p></div>
+    <p>优点是行为简单、可复现；缺点是长 prompt 造成 head-of-line blocking。</p>
+    <div class="callout"><div class="icon">i</div><p><strong>别把 token budget 当成 KV block budget：</strong>已分配 block 的尾部空位只属于原请求，不能给新请求。<a href="../../experiments/one_step_block_demand.py">只读单步估算器</a>可检查给定下一轮的 block 缺口，但无法保证剩余整个生成期都安全，因此稳定 Admission 仍预留全生命周期容量。推导见<a href="../kv_reservation_analysis.md">容量分析</a>。</p></div>
+  </section>
+
+  <section class="chapter"><h2>6. Continuous 与 Static 的唯一区别</h2>
+    <div class="grid-2"><div class="card"><span class="label">Continuous</span><h3>每 step 可 refill</h3><pre><code>step 0: prefill A,B
+step 1: decode A + prefill C
+step 2: decode A,C</code></pre></div><div class="card"><span class="label">Static no-refill</span><h3>等 cohort 排空</h3><pre><code>step 0: prefill A,B
+step 1: decode A       # C 等待
+step 2: decode A
+step 3: prefill C</code></pre></div></div>
+    <p>Static 不是让已完成请求继续 padding compute；它只是禁止向未排空的 running cohort 补新请求。这样实验只改变 admission policy。</p>
+  </section>
+
+  <section class="chapter"><h2>7. apply_step_results() 为什么先完整校验</h2>
+    <p>结果 map 必须与 batch request IDs 完全一致。代码先检查 missing/extra，再验证所有 token 是非负整数，最后才逐请求修改状态。否则写到一半发现缺结果，会留下半更新 Scheduler。</p>
+    <pre><code>expected_ids = tuple(item.request_id for item in batch.items)
+if set(actual_ids) != set(expected_ids):
+    raise ValueError("step result 请求不匹配")
+
+for item in batch.items:
+    request.generated.append(token)
+    if token in eos_ids:
+        finish_reason = EOS
+    elif len(generated) >= max_new_tokens:
+        finish_reason = MAX_TOKENS</code></pre>
+  </section>
+
+  <section class="chapter"><h2>8. abort_step() 如何让失败可重试</h2>
+    <p>Decode 请求在 schedule 时没有改变生成结果；但新 Prefill 请求已经从 waiting 移到 running。失败时：</p>
+    <ul><li>检查它们还没有 prefilled/生成 token；</li><li>状态改回 WAITING；</li><li>从 running 删除；</li><li>按逆序 appendleft，恢复到 waiting 队首且保持 FIFO；</li><li>step index 回退，重试沿用同一编号。</li></ul>
+    <details class="quiz"><summary>检查：为什么 Scheduler 自己不直接释放 blocks？</summary><div class="answer">Scheduler 是纯逻辑状态机，不拥有 GPU storage。它只返回 finished_request_ids；Engine/Admission Controller 才知道并操作 Cache Manager。这样调度策略与存储实现解耦。</div></details>
+    <a class="source-link" href="../../src/mini_llm_runtime/scheduler.py">scheduler.py</a><a class="source-link" href="../scheduler_state_machine.md">状态机设计记录</a><a class="source-link" href="../../tests/test_scheduler.py">test_scheduler.py</a>
+  </section>
+  <div class="pager"><a href="07-paged-attention.html"><small>上一页</small>← 07 · Paged Attention</a><a href="09-engine.html"><small>下一页</small>09 · Continuous Engine →</a></div>
+</article></main></div><script src="assets/app.js"></script></body></html>

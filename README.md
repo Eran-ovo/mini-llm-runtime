@@ -4,10 +4,13 @@
 `Qwen/Qwen2.5-0.5B`，主线是从可信的 Hugging Face reference 出发，逐步实现
 ModelRunner、KV Cache、Paged Attention 和 Continuous Batching。
 
-当前阶段：**v1.0.0 已正式发布**。已具备独立权重加载、Qwen ModelRunner、
+当前源码版本：**v1.1.0**。已具备独立权重加载、Qwen ModelRunner、
 连续与 Paged KV Cache、Decode CUDA Paged Attention、batched Decode、同步
 `ContinuousBatchEngine`、Static/Continuous 调度策略、请求级指标和 clean-tree release
-evaluation。正式版本、Release Notes 和可下载的原始证据归档见
+evaluation。v1.0.0 之后新增了变长多请求 Prefill、容量压力场景的验证与只读单步
+block 需求估算器，以及从基础概念到源码的教程。这些后续改动不自动继承 v1.0.0
+的性能数字；当前列出的正式结果均保留各自的 source commit。v1.0.0 的 Release Notes
+和可下载的原始证据归档见
 [GitHub Release v1.0.0](https://github.com/Eran-ovo/mini-llm-runtime/releases/tag/v1.0.0)。
 
 ## 架构主线
@@ -40,6 +43,10 @@ ModelRunner: embedding -> decoder layers -> logits
 [vLLM Runtime 全流程可视化](docs/vllm_runtime_flow.html)：它按当前代码串起请求调度、
 Prefill/Decode、Paged KV Cache、CUDA Attention 和 Continuous Batching，并标注当前同步
 Engine 的真实边界。
+
+如果希望从 token、tensor 和 Attention 基础开始，一直学到具体 Python/CUDA 实现，请打开
+[从零到源码的多页面教程](docs/tutorial/index.html)。教程包含 13 个页面、shape 表、地址映射、
+事务示例、调度时间线、完整请求跟读和术语速查。
 
 ## 当前稳定能力
 
@@ -328,6 +335,20 @@ python -m experiments.block_aware_scheduler_walkthrough
 原子预留、资源阻塞、完成释放及其利用率代价见
 [Block-aware Admission 学习记录](docs/block_aware_admission.md)。当前仍未实现 chunked
 prefill 和按需增长/preemption；保守预留策略已经接入真实 GPU Continuous Batch Engine。
+
+不要把“已分配 block 中尚未写入的 slot”全部当成空闲容量：block 尾部只能由所属
+请求继续使用，提前预留的 block 也仍占用 pool。为检查某个 **给定下一步** 的
+Decode + Prefill 是否能同时获得新 block，项目提供独立的只读
+[`one_step_block_demand` 实验](experiments/one_step_block_demand.py)：它校验完整活动
+快照与 free block 数守恒，逐请求计算新增 block 和缺口，不修改 Scheduler/Cache。
+用正式 block-pressure 轨迹作容量推导，28-block 场景若只按当前 token 长度分配，
+下一步仍会出现 `4 块需求 > 3 块空闲`。这不是性能 benchmark；单步可行也不能
+保证整段生成不 OOM，因此实验没有接入稳定 admission。推导、复现边界和原始
+证据见 [KV 预留容量分析](docs/kv_reservation_analysis.md)，对应单测可运行：
+
+```bash
+python -m pytest -q tests/test_one_step_block_demand.py
+```
 
 多请求 Decode adapter 已能按 Scheduler 指定顺序，为不同历史长度的请求原子追加一枚
 K/V，构造 padded GPU block table，并让一次 CUDA Paged Attention 与逐请求 CUDA/Python

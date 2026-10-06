@@ -1,0 +1,95 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>03 配置与权重加载 · mini-vLLM</title><link rel="stylesheet" href="assets/style.css"></head>
+<body data-page="03-model-loading"><div class="layout"><main class="page"><article class="content">
+  <div class="crumb">Chapter 03 · Model Loading</div><h1>模型如何从磁盘变成可计算的 Tensor</h1><p class="lead">这一章沿着 <code>load_qwen_checkpoint()</code> 往下走：先读结构配置，再读 safetensors，最后把几百个字符串 key 变成强类型的层级对象。</p>
+
+  <section class="chapter"><h2>1. 模型目录里有什么</h2>
+    <div class="grid-3"><div class="card"><h3>config.json</h3><p>描述模型结构：hidden size、层数、attention heads、RoPE 参数等。它像“建筑图纸”。</p></div><div class="card"><h3>*.safetensors</h3><p>真正的浮点权重。它像“建筑材料”。大模型可能拆成多个 shard。</p></div><div class="card"><h3>index.json</h3><p>分片索引：每个权重 key 在哪个 shard 文件中。单文件模型可以没有。</p></div></div>
+    <pre><code>model_dir/
+├── config.json
+├── model.safetensors                 # 单文件情况
+# 或
+├── model.safetensors.index.json      # 分片索引
+├── model-00001-of-00002.safetensors
+└── model-00002-of-00002.safetensors</code></pre>
+  </section>
+
+  <section class="chapter"><h2>2. QwenConfig：只保留 runtime 真正需要的字段</h2>
+    <p><code>QwenConfig</code> 是冻结 dataclass。它不是照搬 Hugging Face 的所有字段，而是显式列出当前 Runner 支持的最小结构。</p>
+    <pre><code>@dataclass(frozen=True)
+class QwenConfig:
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    max_position_embeddings: int
+    rms_norm_eps: float
+    rope_theta: float
+    hidden_act: str
+    tie_word_embeddings: bool</code></pre>
+    <table class="shape-table"><thead><tr><th>字段</th><th>决定什么</th><th>代码中的派生量</th></tr></thead><tbody>
+      <tr><td>hidden_size</td><td>token 内部表示宽度 H</td><td><code>head_dim = H / Hq</code></td></tr>
+      <tr><td>num_attention_heads</td><td>Query head 数 Hq</td><td>Q projection 输出 Hq×D</td></tr>
+      <tr><td>num_key_value_heads</td><td>KV head 数 Hkv</td><td><code>gqa_group_size = Hq/Hkv</code></td></tr>
+      <tr><td>intermediate_size</td><td>SwiGLU 中间层宽度</td><td>gate/up projection 输出</td></tr>
+      <tr><td>num_hidden_layers</td><td>Decoder 重复层数</td><td>Cache 第一维和层循环</td></tr>
+      <tr><td>vocab_size</td><td>词表大小 V</td><td>Embedding 行数、logits 最后一维</td></tr>
+    </tbody></table>
+    <h3>为什么要拒绝不支持的配置？</h3>
+    <pre><code>if data.get("model_type") != "qwen2":
+    raise ValueError("只支持 model_type=qwen2")
+if data.get("rope_scaling") is not None:
+    raise ValueError("当前 Runner 尚不支持 rope_scaling")
+if self.hidden_act != "silu":
+    raise ValueError("当前 Runner 只支持 SiLU/SwiGLU")</code></pre>
+    <p>静默接受未知变体很危险：程序可能能运行，却算错结果。教学 runtime 选择“早失败”，把支持边界写成可执行校验。</p>
+    <a class="source-link" href="../../src/mini_llm_runtime/qwen_config.py">打开 qwen_config.py</a>
+  </section>
+
+  <section class="chapter"><h2>3. 先规划 shard，再读取 Tensor</h2>
+    <div class="steps"><div class="step"><div><b>查找 index</b><p>存在 <code>model.safetensors.index.json</code> 时，读取 <code>weight_map</code>，得到所有 shard 文件名。</p></div></div><div class="step"><div><b>否则查单文件</b><p>优先找 <code>model.safetensors</code>。发现分片但没有 index 会直接报错。</p></div></div><div class="step"><div><b>逐 shard 在 CPU 打开</b><p><code>safe_open(..., device="cpu")</code>，逐 key 读取，随后搬到目标 device/dtype。</p></div></div><div class="step"><div><b>验证索引</b><p>检查缺 key、多 key、重复 key、key 位于错误 shard，防止 checkpoint 不完整。</p></div></div></div>
+    <pre><code>with safe_open(str(path), framework="pt", device="cpu") as handle:
+    for key in handle.keys():
+        tensor = handle.get_tensor(key)
+        target_dtype = dtype if dtype is not None else tensor.dtype
+        state_dict[key] = tensor.to(
+            device=target_device,
+            dtype=target_dtype,
+        )</code></pre>
+    <div class="callout warn"><div class="icon">!</div><p>这里先在 CPU 读取，再转换到 GPU。加载 Qwen 0.5B 时也要注意峰值显存：实验脚本会先释放 HF reference，再加载自有 Runner，避免 6 GB GPU 同时放两份模型。</p></div>
+  </section>
+
+  <section class="chapter"><h2>4. state_dict 为什么还要映射成 QwenWeights</h2>
+    <p>原始 state_dict 是 <code>dict[str, Tensor]</code>。字符串灵活，但容易拼错，也不表达层级关系。项目把它转换成：</p>
+    <pre><code>QwenWeights
+├── embedding
+├── layers: tuple[DecoderLayerWeights, ...]
+│   ├── input_norm
+│   ├── attention
+│   │   ├── q_proj / k_proj / v_proj / o_proj
+│   ├── post_attention_norm
+│   └── mlp
+│       ├── gate_proj / up_proj / down_proj
+└── final_norm</code></pre>
+    <p>内部的 <code>take(name, shape)</code> 同时完成三件事：要求 key 存在、要求 shape 正确、记录该 key 已被消费。</p>
+    <pre><code>def take(name, shape):
+    if name not in state_dict:
+        raise KeyError(f"缺少权重：{name}")
+    tensor = state_dict[name]
+    if tuple(tensor.shape) != shape:
+        raise ValueError("shape 不匹配")
+    consumed.add(name)
+    return tensor</code></pre>
+    <div class="example"><div class="example-title">Q projection 的 shape 为什么是 [H,H]？</div><p>输入 hidden state 最后一维是 H。Qwen 的 Q 有 Hq 个 head，每个 D 维，且 Hq×D=H，所以输出仍是 H。PyTorch <code>F.linear(x, weight)</code> 的 weight 布局是 <code>[out_features,in_features]</code>，因此是 <code>[H,H]</code>。</p><p>K/V 输出只需要 Hkv×D，所以 shape 是 <code>[Hkv×D,H]</code>。</p></div>
+  </section>
+
+  <section class="chapter"><h2>5. Tied Embedding 是什么</h2>
+    <p>Embedding 把 token ID 查表变成 hidden vector；LM Head 把 hidden vector投影回词表 logits。当前 Qwen 配置让两者共享同一张矩阵：</p>
+    <div class="formula">embedding: token_id → embedding_weight[token_id]<br>lm_head: logits = hidden × embedding_weightᵀ</div>
+    <p>如果 checkpoint 同时提供 <code>lm_head.weight</code>，代码要求它与 embedding 数值相同，否则报错。这避免“配置说共享，权重却不共享”的不一致。</p>
+    <details class="quiz"><summary>检查：为什么最后还要拒绝 unexpected keys？</summary><div class="answer">如果加载后还有未消费的权重，可能说明 checkpoint 模型变体与当前实现不同，或者映射漏了层。忽略它们会让“不完整实现”悄悄运行。</div></details>
+    <a class="source-link" href="../../src/mini_llm_runtime/qwen_loader.py">qwen_loader.py</a><a class="source-link" href="../../src/mini_llm_runtime/qwen_weights.py">qwen_weights.py</a><a class="source-link" href="../../experiments/direct_safetensors_runner.py">加载实验</a>
+  </section>
+  <div class="pager"><a href="02-project-map.html"><small>上一页</small>← 02 · 项目地图</a><a href="04-qwen-forward.html"><small>下一页</small>04 · Qwen 前向计算 →</a></div>
+</article></main></div><script src="assets/app.js"></script></body></html>

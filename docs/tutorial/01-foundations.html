@@ -1,0 +1,50 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>01 零基础概念 · mini-vLLM</title><link rel="stylesheet" href="assets/style.css"></head>
+<body data-page="01-foundations"><div class="layout"><main class="page"><article class="content">
+  <div class="crumb">Chapter 01 · Foundations</div><h1>先补齐推理系统的基础词汇</h1>
+  <p class="lead">如果 token、tensor、head、logits、Prefill 这些词还不熟，不要跳过这一页。后续所有源码，本质上都在搬运这些对象。</p>
+
+  <section class="chapter"><h2>1. 从文本到 Token ID</h2>
+    <p>神经网络不能直接接收汉字或英文字符串。Tokenizer 按自己的词表规则把文本切成 token，再把每个 token 映射成整数 ID。</p>
+    <div class="example"><div class="example-title">简化示例（数字仅用于讲解）</div><div class="flow" style="min-width:600px"><div class="node">“KV Cache 很快”</div><div class="arrow">→</div><div class="node blue">[“KV”, “ Cache”, “ 很”, “快”]</div><div class="arrow">→</div><div class="node orange">[8132, 447, 109, 281]</div></div></div>
+    <p><strong>注意：</strong>token 不等于汉字，也不等于单词。它是 tokenizer 词表里的一个片段。项目的稳定 runtime 从 token ID 开始；文本编码/解码仍由外部 tokenizer 完成。</p>
+  </section>
+
+  <section class="chapter"><h2>2. Tensor 与 Shape</h2>
+    <p>Tensor 可以先理解为“带形状的多维数组”。在代码里，shape 比变量名更能说明数据是什么。</p>
+    <table class="shape-table"><thead><tr><th>符号</th><th>含义</th><th>示例</th></tr></thead><tbody>
+      <tr><td><code>B</code></td><td>batch size，同时处理的请求数</td><td>3 个请求 → B=3</td></tr>
+      <tr><td><code>S</code></td><td>sequence length，token 数量</td><td>prompt 有 8 token → S=8</td></tr>
+      <tr><td><code>H</code></td><td>hidden size，每个 token 的内部向量宽度</td><td>Qwen2.5-0.5B 常见 H=896</td></tr>
+      <tr><td><code>Hq/Hkv</code></td><td>Query head / KV head 数量</td><td>GQA 中 Hq 可以大于 Hkv</td></tr>
+      <tr><td><code>D</code></td><td>每个 attention head 的维度</td><td>D = H / Hq = 64</td></tr>
+      <tr><td><code>V</code></td><td>vocabulary size，词表大小</td><td>logits 最后一维</td></tr>
+    </tbody></table>
+    <div class="example"><div class="example-title">读 shape 的方法</div><p><span class="tensor">hidden_states [B,S,H]</span> 表示：B 个请求，每个请求 S 个 token，每个 token 用 H 个浮点数表示。</p><p><span class="tensor">query [B,Hq,S,D]</span> 表示：把 hidden 维拆成 Hq 个注意力头，每个头宽 D。</p></div>
+  </section>
+
+  <section class="chapter"><h2>3. 模型不是“输出文字”，而是输出 Logits</h2>
+    <p>模型最后输出 <code>[B,S,V]</code> 的 logits。对每个位置，它为词表里的每个 token 给出一个未归一化分数。Greedy decoding 直接选择最大分数的 token：</p>
+    <div class="formula">next_token = argmax(logits[:, -1, :], dim=-1)</div>
+    <div class="grid-3"><div class="card"><h4>token 42</h4><p>logit = 1.2</p></div><div class="card"><h4>token 99</h4><p>logit = 4.8 ← 最大</p></div><div class="card"><h4>token 105</h4><p>logit = −0.3</p></div></div>
+    <p>所以本项目的生成策略很简单：每一步取 argmax。它没有 temperature、top-k 或 top-p。</p>
+  </section>
+
+  <section class="chapter"><h2>4. Prefill 与 Decode 为什么要分开</h2>
+    <table class="compare-table"><thead><tr><th></th><th>Prefill</th><th>Decode</th></tr></thead><tbody>
+      <tr><td>输入</td><td>完整 prompt：<code>[B,S]</code></td><td>上一步生成的 1 个 token：<code>[B,1]</code></td></tr>
+      <tr><td>工作</td><td>并行处理所有 prompt token</td><td>只计算新 token，读取历史 K/V</td></tr>
+      <tr><td>产出</td><td>初始化 Cache + 第一个输出 token</td><td>Cache 追加 1 + 下一个 token</td></tr>
+      <tr><td>瓶颈倾向</td><td>矩阵计算密集</td><td>读历史 KV，显存带宽/launch 更敏感</td></tr>
+    </tbody></table>
+    <div class="diagram"><div class="flow"><div class="node orange"><strong>Prompt 4 tokens</strong><small>A B C D</small></div><div class="arrow">→</div><div class="node green"><strong>Prefill</strong><small>一次 forward</small></div><div class="arrow">→</div><div class="node"><strong>首 token E</strong><small>Cache: A B C D</small></div><div class="arrow">→</div><div class="node blue"><strong>Decode(E)</strong><small>Cache += E</small></div><div class="arrow">→</div><div class="node"><strong>token F</strong></div></div></div>
+    <div class="callout warn"><div class="icon">!</div><p>生成 N 个新 token 最多只需要 N−1 次 Decode。最后一个 token 已经输出给用户，不会再作为输入计算，所以 Cache 最大长度是 <code>prompt_length + max_new_tokens − 1</code>。</p></div>
+  </section>
+
+  <section class="chapter"><h2>5. Attention 最小直觉</h2>
+    <p>每个 token 会产生 Q（我想找什么）、K（我能被怎样匹配）、V（匹配后拿走什么信息）。当前 Query 对历史所有 Key 打分，再用 softmax 得到权重，加权求和历史 Value。</p>
+    <div class="formula">scores = Q × Kᵀ / √D<br>probabilities = softmax(scores)<br>output = probabilities × V</div>
+    <div class="example"><div class="example-title">生活类比</div><p>Query 像搜索词；Key 像每篇文档的索引；Q·K 是相关度；softmax 把相关度变成总和为 1 的权重；Value 是最终读出的文档内容。</p></div>
+    <details class="quiz"><summary>检查：为什么 Decode 只需要计算新 token 的 Q/K/V？</summary><div class="answer">历史 token 的 K/V 在它们第一次计算时已经保存到 KV Cache。新 Query 仍需读取全部历史 K/V，但不必重新计算历史 token 的投影。</div></details>
+  </section>
+  <div class="pager"><a href="index.html"><small>上一页</small>← 首页</a><a href="02-project-map.html"><small>下一页</small>02 · 项目地图与架构 →</a></div>
+</article></main></div><script src="assets/app.js"></script></body></html>

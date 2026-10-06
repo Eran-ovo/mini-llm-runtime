@@ -1,0 +1,57 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>10 测试与 Benchmark · mini-vLLM</title><link rel="stylesheet" href="assets/style.css"></head>
+<body data-page="10-testing"><div class="layout"><main class="page"><article class="content">
+  <div class="crumb">Chapter 10 · Evidence</div><h1>如何证明“算对了”和“真的更快”</h1><p class="lead">推理系统最容易犯的错误，是把“能运行”当成“正确”，把“一次更快”当成“有性能结论”。这个项目把证据分成不同层级，并保存原始条件。</p>
+
+  <section class="chapter"><h2>1. 四层正确性金字塔</h2>
+    <div class="grid-4"><div class="card"><span class="label">Level 1</span><h3>数学</h3><p>Q/K/V、RoPE、RMSNorm、MLP 中间 tensor 与 HF 逐检查点对拍。</p></div><div class="card"><span class="label">Level 2</span><h3>状态</h3><p>Cache 增长、失败回滚、block 复用、double-free、row 顺序。</p></div><div class="card"><span class="label">Level 3</span><h3>Kernel</h3><p>CUDA 与 Python reference/连续 Attention 对拍多长度、多块、GQA。</p></div><div class="card"><span class="label">Level 4</span><h3>端到端</h3><p>Continuous Engine 每请求完整 greedy tokens 与 HF oracle exact match。</p></div></div>
+  </section>
+
+  <section class="chapter"><h2>2. 为什么 HF baseline 不用 generate()</h2>
+    <p><code>transformers.generate()</code> 内部包含采样、停止、Cache、beam 等复杂控制逻辑，不适合作为每一步可观察的 oracle。项目显式调用：</p>
+    <pre><code>prefill(input_ids, attention_mask)
+→ 取最后位置 logits
+→ argmax 得到 token
+→ decode_one(token, past_key_values)
+→ 重复</code></pre>
+    <p>这样每一步 logits、token 和 Cache 都能单独与自有 Runner 对拍。</p>
+  </section>
+
+  <section class="chapter"><h2>3. 单元测试为什么尽量不用真实大模型</h2>
+    <p>快速测试使用小 tensor、fake causal LM 或 monkeypatch reference，避免网络、下载和 GPU 环境让状态机测试变慢/不稳定。真实 Qwen correctness 由独立 CLI gate 执行。</p>
+    <table class="compare-table"><thead><tr><th>测试类型</th><th>回答的问题</th><th>例子</th></tr></thead><tbody><tr><td>纯 CPU unit test</td><td>状态、shape、异常是否正确</td><td>Scheduler FIFO、allocator double-free</td></tr><tr><td>CUDA parameterized</td><td>kernel 数值与边界</td><td>变长、非连续 block、GQA</td></tr><tr><td>真实模型 experiment</td><td>完整 Qwen 是否与 HF 一致</td><td>逐层 logits、最终 tokens</td></tr><tr><td>release gate</td><td>同一 clean commit 是否整体通过</td><td>182 passed + correctness + benchmark</td></tr></tbody></table>
+  </section>
+
+  <section class="chapter"><h2>4. 请求级指标的严格定义</h2>
+    <div class="formula">queue_wait = first_prefill_start − arrival<br>TTFT = first_token_ready − arrival<br>TPOT[i] = token[i+1]_ready − token[i]_ready<br>E2E = last_token_ready − arrival<br>post_token = completed − last_token_ready</div>
+    <div class="callout"><div class="icon">i</div><p>只有一个输出 token 的请求没有相邻 token，因此 TPOT 是 <code>None</code>，不是 0。填 0 会让短请求虚假拉低总体 TPOT。</p></div>
+    <p>同一个 Engine step 的多个请求共享一次 D2H，它们的 <code>ready_ns</code> 可以相同。这代表控制面真正同时看到这些 token。</p>
+  </section>
+
+  <section class="chapter"><h2>5. Benchmark 纪律</h2>
+    <ul class="checklist"><li>先 warmup，排除首次 JIT/缓存影响</li><li>保存所有 raw samples，不只写一个平均值</li><li>用 median，并说明 percentile 算法</li><li>对照 case 每轮交错，奇偶轮反转执行顺序</li><li>记录 GPU、驱动、CUDA、PyTorch、Python 和 Git commit</li><li>记录 peak memory、功耗/频率漂移边界</li><li>Correctness 必须先通过，再接受性能样本</li></ul>
+    <p>kernel 微秒级 benchmark 使用 CUDA Event 包围多次 launch，再除以 iteration 数；端到端 TTFT/E2E 使用 CPU 单调时钟，因为它要覆盖排队和控制面。</p>
+  </section>
+
+  <section class="chapter"><h2>6. Static vs Continuous 的正式结果</h2>
+    <table class="compare-table"><thead><tr><th>Policy</th><th>Throughput</th><th>TTFT median</th><th>TPOT median</th><th>E2E median</th></tr></thead><tbody><tr><td>Continuous</td><td>70.67 tok/s</td><td>183.71 ms</td><td>25.59 ms</td><td>418.88 ms</td></tr><tr><td>Static</td><td>65.33 tok/s</td><td>331.26 ms</td><td>24.00 ms</td><td>475.94 ms</td></tr></tbody></table>
+    <p>本表来自 v1.0.0 release candidate 的 clean-tree evidence <code>e01c3c7</code>，不是 v1.1.0 的重新测量。在固定 8-request burst workload 下，Continuous 吞吐 +8.18%、TTFT −44.54%、E2E −11.99%，但 TPOT +6.64%（更慢）。原因是动态 refill 减少等待，却让 mixed Prefill 干扰已有 Decode。</p>
+    <div class="callout danger"><div class="icon">×</div><p>不能把这些数字外推到其他模型、GPU、prompt 分布或在线 arrival。它们只证明这个固定实验条件下的行为。</p></div>
+  </section>
+
+  <section class="chapter"><h2>7. Mixed Prefill Budget 的负结果也有价值</h2>
+    <p>同一份 v1.0.0 release candidate evidence 中，项目尝试限制 mixed step 新接纳的 Prefill tokens，希望减轻 TPOT 干扰。budget=4 让 TPOT median 改善 5.28%，却使吞吐下降 8.75%、TTFT p95 上升 25.91%、E2E p95 上升 15.02%。这些数字也不是 v1.1.0 的新 benchmark。</p>
+    <p>因此这个旋钮保留在代码里作为教学实验，但默认关闭、不作为推荐策略。好的工程记录不仅保存成功优化，也保存被数据否决的方向。</p>
+  </section>
+
+  <section class="chapter"><h2>8. Clean-tree Release Evaluation</h2>
+    <div class="steps"><div class="step"><div><b>创建临时 detached worktree</b><p>不 stash/reset 用户当前工作区。</p></div></div><div class="step"><div><b>覆盖 editable-install PYTHONPATH</b><p>确保运行的是临时 worktree 源码，而不是主目录旧 editable package。</p></div></div><div class="step"><div><b>顺序执行全测、HF gate、正式 benchmark</b><p>任何子步骤失败，bundle 的 passed=false。</p></div></div><div class="step"><div><b>生成 manifest</b><p>14 个 artifact 记录相对路径、大小和 SHA-256，并绑定同一 commit。</p></div></div></div>
+    <pre><code>source /home/eran/venvs/torch/bin/activate
+python -m pytest -q
+
+python scripts/run_release_evaluation.py \
+  --output-dir benchmarks/results/release_candidate_v1</code></pre>
+    <details class="quiz"><summary>检查：为什么 profiler 数据不能直接当端到端性能数据？</summary><div class="answer">Profiler 往往只采一个 kernel 或有限时间窗，且采集本身有开销。它用于解释 occupancy、memory access、stall 或 host 时序；TTFT/TPOT/E2E 则需要完整 workload、多轮 raw samples 和明确的用户可见边界。</div></details>
+    <a class="source-link" href="../../src/mini_llm_runtime/hf_baseline.py">hf_baseline.py</a><a class="source-link" href="../../src/mini_llm_runtime/request_metrics.py">request_metrics.py</a><a class="source-link" href="../../scripts/run_release_evaluation.py">release evaluation</a><a class="source-link" href="../evidence_index.md">证据索引</a>
+  </section>
+  <div class="pager"><a href="09-engine.html"><small>上一页</small>← 09 · Engine</a><a href="11-reading-lab.html"><small>下一页</small>11 · 源码阅读实战 →</a></div>
+</article></main></div><script src="assets/app.js"></script></body></html>
