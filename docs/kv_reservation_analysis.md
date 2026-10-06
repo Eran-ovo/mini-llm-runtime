@@ -48,6 +48,32 @@ Step 0 的 448 个已预留 slot 中有 63 个未提交：48 个来自三块未�
 抢占或其他容量保护语义，并重新证明正确性；单纯去掉 admission 预留会
 引入 Decode 中途 OOM 风险。
 
+## 收尾实验：只读单步容量估算器
+
+`experiments/one_step_block_demand.py` 把上述反事实推广成任意数量请求的纯函数。
+输入是完整活动请求快照、真实 free block 数、下一步 Decode 请求 ID 与新
+Prefill 的 prompt 长度。它先校验 `已分配 block + free block = pool block`，
+再逐请求计算：
+
+```text
+Decode 新增块 = max(0, ceil((committed_tokens + 1) / B) - allocated_blocks)
+Prefill 新增块 = ceil(prompt_tokens / B)
+本步缺口 = max(0, 所有新增块之和 - free_blocks)
+```
+
+这把两种容量分开了：已归属请求的 block 尾部 slot 可供该请求继续写入，
+却不是其他请求可领取的 free block。即使某请求将在本步结束，也要等释放真正
+发生后才能把其 block 算进下一步 free 数。对上述原始轨迹直接读取首步快照
+交叉检查：28-block 压力 case 在当前预留策略下 `free=0、需新增=1、缺口=1`；
+若只分配当前长度，则 `free=3、需新增=4、缺口=1`。29-block case 两种
+分配方式都恰好无缺口。
+
+估算器不触碰 GPU、不修改 Cache/Scheduler，也不产生新的性能数据。
+它只回答**给定下一步**能否在释放前获得足够 block；不保证后续整个生成过程
+的容量安全，因此不能替换现有的全生命周期 admission。这里停止进一步的
+容量优化；若未来有真实 workload 证据需要更激进的策略，再单独设计
+preemption 或新的准入语义。
+
 ## 证据与边界
 
 来源是 source commit `2c6a9ba` 的两份正式 benchmark JSON；派生脚本 commit

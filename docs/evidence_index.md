@@ -105,6 +105,8 @@ Release bundle 不进入 Git；通过
   Decode 增长加晚到 Prefill 需 4 块，仍差 1 块；
 - 这是有 SHA-256 来源绑定的确定性容量推导，不是新 benchmark，也不是
   增量分配的实测收益；见 `docs/kv_reservation_analysis.md`。
+- 后续只读单步估算器位于 `experiments/one_step_block_demand.py`，复核了原始
+  pressure/spare 快照与反事实边界；不接入稳定 Scheduler，不增加性能结论。
 
 ### Block Pressure Waiting / Reuse HF Gate
 
