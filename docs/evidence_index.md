@@ -94,6 +94,18 @@ Release bundle 不进入 Git；通过
 
 ## Formal Correctness
 
+### KV Reservation Derived Analysis
+
+- 分析脚本 commit：`e370dd5`；来源是 `2c6a9ba` 两份 clean-tree block-pressure
+  TTFT benchmark，分析结果位于
+  `benchmarks/results/kv_reservation_derived_run{1,2}_clean_e370dd5/result.json`；
+- 首步 28 块中当前长度只需 25 块，另 3 块提前预留；63 个未提交 slot
+  分为 48 个未来预留 slot 与 15 个当前块尾部空位；
+- 在不改下一 step 集合/执行顺序的反事实下，28-block pool 可用 3 块而
+  Decode 增长加晚到 Prefill 需 4 块，仍差 1 块；
+- 这是有 SHA-256 来源绑定的确定性容量推导，不是新 benchmark，也不是
+  增量分配的实测收益；见 `docs/kv_reservation_analysis.md`。
+
 ### Block Pressure Waiting / Reuse HF Gate
 
 - source commit：`d0d1c33`；clean-tree 路径：
