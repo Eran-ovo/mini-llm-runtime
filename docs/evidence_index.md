@@ -20,6 +20,17 @@ Release bundle 不进入 Git；通过
 
 ## Formal Benchmark
 
+### Block Pressure Late-Request TTFT
+
+- source commit：`2c6a9ba`；两次独立 clean-tree 运行：
+  `benchmarks/results/block_pressure_ttft_{clean,repeat2_clean}_2c6a9ba/result.json`；
+- 只改变 pool 大小 28/29 blocks；晚到请求均在首个 step 后提交；
+  warmup 3、measured 10，每轮两个 case 交错并反转顺序；
+- 两次运行全部 HF token/path gate 通过，配对 TTFT 差值 median 分别为
+  `23.60 ms`、`24.82 ms`；原始 CPU 请求事件、CUDA Event、峰值显存和
+  环境/Git 信息均在 JSON，详见 `docs/block_pressure_ttft_benchmark.md`；
+- 固定 step-relative 到达场景，不外推到真实线上负载。
+
 ### v2.7 Packed Prefill 分层正确性门禁
 
 - source commit：`1df7406`；路径：
