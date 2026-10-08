@@ -2,12 +2,13 @@
 
 ## 数据结构与数据流
 
-稳定入口最终只保留四个核心对象：
+当前稳定执行由 Request 状态、Scheduler、Engine、KV Cache Manager 与 ModelRunner 协作：
 
-- `Request`：prompt token、生成上限、状态、已生成 token 和逻辑 block table。
+- `RequestState`：prompt token、生成上限、状态和已生成 token；block table 属于 Cache Manager。
 - `Scheduler`：维护 waiting/running queue，按 token budget 与空闲 block 选择本轮 batch。
 - `KVCacheManager`：拥有 GPU block pool 与 free list，负责 allocate/append/free。
 - `ModelRunner`：接受本轮 token、position 和 block table，执行各层并返回 logits。
+- `ContinuousBatchEngine`：执行调度计划、收集 GPU token、提交结果、回滚失败并释放已完成请求资源。
 
 Prefill batch 可以包含多个 prompt token；执行后，K/V 按层写入属于请求的 block。
 Decode batch 中每个运行请求通常贡献一个 query token；Paged Attention 根据
@@ -16,7 +17,7 @@ Decode batch 中每个运行请求通常贡献一个 query token；Paged Attenti
 
 Qwen2.5-0.5B 使用 GQA：query head 数量可大于 KV head 数量。query head `h` 通过
 `kv_h = h // (num_query_heads / num_kv_heads)` 共享对应的 K/V head；后续 CUDA kernel
-必须显式验证这一地址映射。
+已显式验证这一地址映射。
 
 ## 为什么按此顺序实现
 
@@ -75,7 +76,17 @@ CPU/GPU overlap 不属于该里程碑。
 - Nsight Systems/Compute 分析能解释主要瓶颈，并记录有价值的失败实验。
 - 简历数字只引用仓库内正式结果；创建 release 前稳定入口通过全部测试。
 
-当前已有 clean-tree release candidate：detached worktree 中全量测试、HF correctness、两套
-正式 benchmark 均通过，所有 artifact 绑定同一 commit 且 `git_dirty=false`。复现方法见
-[Clean-Tree Release Evaluation](release_evaluation.md)；下一步只整理 README、证据索引、
-失败实验与最终 release 说明，不再增加 Runtime 功能。
+v1.0.0 已发布：detached clean worktree 中全量测试、HF correctness、两套正式
+benchmark 均通过，artifact 绑定同一 commit 且 `git_dirty=false`。
+完整归档见 [Release v1.0.0](https://github.com/Eran-ovo/mini-llm-runtime/releases/tag/v1.0.0)，
+复现方法见 [Clean-Tree Release Evaluation](release_evaluation.md)。
+
+### v1.1.0 源码与验证增强
+
+- 变长 packed Prefill、vectorized KV write 与形状感知 Prefill Attention backend。
+- 变长请求续写、late mixed step、容量压力 waiting、physical block 复用与全回收 HF gate。
+- 只读 KV reservation/单步需求分析，以及从基础到源码的多页教程。
+- 该版本全量测试记录为 `280 passed`；历史性能继续绑定原始采样 commit。
+
+当前源码导航见 [阅读路线](reading-guide.md)。后续仍围绕单 GPU Decode kernel、
+Prefill/Decode 取舍与 KV 生命周期推进。

@@ -5,6 +5,16 @@
 
 ## Clean-tree Release Candidate
 
+当前源码版本为 **v1.1.0**，该版本的全量测试记录为 `280 passed`。
+首页选用的正式数字来自已发布 v1.0.0 的 `d31ded2` benchmark，
+以及 Prefill backend 的 `7f4c844` benchmark；二者没有改写为当前版本性能。
+GitHub 可直接查看 [公开样本与统计定义](benchmarks/README.md)，
+摘录包含来源 SHA-256、原始样本和环境。
+
+下面的 `e01c3c7` 是发布前历史 candidate；最终 v1.0.0 归档位于
+`release_v1_d31ded2/`，已发布到
+[Release v1.0.0](https://github.com/Eran-ovo/mini-llm-runtime/releases/tag/v1.0.0)。
+
 - source commit：`e01c3c737a5ee55d9e14544c5108c0ae0a5b6a66`；
 - full tests：`180 passed`；
 - bundle：`benchmarks/results/release_candidate_e01c3c7/`；
@@ -14,9 +24,10 @@
 - 三个正式 JSON 均记录相同 commit 且 `git_dirty=false`；
 - bundle 内 14 个非 manifest 文件均有相对路径、大小和 SHA-256。
 
-Release bundle 不进入 Git；通过
-`scripts/run_release_evaluation.py --output-dir <new-directory>` 复现，或在未来 GitHub Release
-中作为独立 artifact 发布。
+完整 Release bundle 不进入 Git；通过
+`scripts/run_release_evaluation.py --output-dir <new-directory>` 复现。
+最终 v1.0.0 bundle 已作为独立 Release asset 发布；本仓库另外提交了
+`docs/benchmarks/` 下的轻量正式样本摘录。
 
 ## Formal Benchmark
 

@@ -1,0 +1,240 @@
+{
+  "provenance": {
+    "classification": "excerpt_of_existing_formal_benchmark",
+    "source_path": "benchmarks/results/v2_4_attention_len512_clean_7f4c844/result.json",
+    "source_sha256": "bcebba8a0fdef269a439518806441b5b33d632f09f24bfeeb430816398e29655",
+    "source_commit": "7f4c8444c34b78732775f8df86582e5c7f4075ce",
+    "retained_fields": [
+      "classification",
+      "scope",
+      "model",
+      "fixed_prompt_length",
+      "request_ids",
+      "block_size",
+      "correctness",
+      "cases",
+      "environment_before",
+      "environment_after"
+    ],
+    "note": "Measured values and raw samples are unchanged. Full per-step traces/prompt buffers may be omitted."
+  },
+  "classification": "formal_clean_tree",
+  "scope": "Prefill ModelRunner + Paged KV write; excludes input construction and scheduling",
+  "model": "Qwen/Qwen2.5-0.5B",
+  "fixed_prompt_length": 512,
+  "request_ids": [
+    "request-0",
+    "request-1",
+    "request-2",
+    "request-3"
+  ],
+  "block_size": 16,
+  "correctness": {
+    "packed": {
+      "logits_match": true,
+      "logits_elementwise_close": false,
+      "logits_max_abs_diff": 0.07470703125,
+      "logits_relative_l2": 0.003286340506747365,
+      "tokens_match": true,
+      "kv_match": true,
+      "kv_max_abs_diff": 0.8515625,
+      "kv_max_relative_l2": 0.008169036358594894,
+      "kv_worst_values": [
+        -8.6953125,
+        -7.84375
+      ]
+    },
+    "segmented": {
+      "logits_match": true,
+      "logits_elementwise_close": false,
+      "logits_max_abs_diff": 0.06640625,
+      "logits_relative_l2": 0.003929294645786285,
+      "tokens_match": true,
+      "kv_match": true,
+      "kv_max_abs_diff": 0.46875,
+      "kv_max_relative_l2": 0.007281267549842596,
+      "kv_worst_values": [
+        -8.6953125,
+        -8.2265625
+      ]
+    },
+    "packed_vectorized": {
+      "logits_match": true,
+      "logits_elementwise_close": false,
+      "logits_max_abs_diff": 0.07470703125,
+      "logits_relative_l2": 0.003286340506747365,
+      "tokens_match": true,
+      "kv_match": true,
+      "kv_max_abs_diff": 0.8515625,
+      "kv_max_relative_l2": 0.008169036358594894,
+      "kv_worst_values": [
+        -8.6953125,
+        -7.84375
+      ]
+    }
+  },
+  "cases": {
+    "serial": {
+      "warmup": 2,
+      "repeats": 6,
+      "samples_ms": [
+        2418.408203125,
+        2429.476806640625,
+        2386.83447265625,
+        2395.8671875,
+        2466.954345703125,
+        2396.23486328125
+      ],
+      "median_ms": 2407.321533203125,
+      "peak_memory_bytes": 1655777280,
+      "peak_memory_samples_bytes": [
+        1655777280,
+        1655777280,
+        1655777280,
+        1655777280,
+        1655777280,
+        1655777280
+      ]
+    },
+    "packed": {
+      "warmup": 2,
+      "repeats": 6,
+      "samples_ms": [
+        1835.0069580078125,
+        1824.1964111328125,
+        1821.1328125,
+        1831.5765380859375,
+        1818.0064697265625,
+        1805.4501953125
+      ],
+      "median_ms": 1822.6646118164062,
+      "peak_memory_bytes": 1524099072,
+      "peak_memory_samples_bytes": [
+        1524099072,
+        1524099072,
+        1524099072,
+        1524099072,
+        1524099072,
+        1524099072
+      ]
+    },
+    "segmented": {
+      "warmup": 2,
+      "repeats": 6,
+      "samples_ms": [
+        135.92857360839844,
+        137.04495239257812,
+        133.7743377685547,
+        139.293701171875,
+        135.70150756835938,
+        137.0213165283203
+      ],
+      "median_ms": 136.47494506835938,
+      "peak_memory_bytes": 1107290112,
+      "peak_memory_samples_bytes": [
+        1107290112,
+        1107290112,
+        1107290112,
+        1107290112,
+        1107290112,
+        1107290112
+      ]
+    },
+    "packed_vectorized": {
+      "warmup": 2,
+      "repeats": 6,
+      "samples_ms": [
+        364.7457275390625,
+        373.3749694824219,
+        389.0043029785156,
+        370.8835754394531,
+        379.0325622558594,
+        362.87078857421875
+      ],
+      "median_ms": 372.1292724609375,
+      "peak_memory_bytes": 1524131840,
+      "peak_memory_samples_bytes": [
+        1524131840,
+        1524131840,
+        1524131840,
+        1524131840,
+        1524131840,
+        1524131840
+      ]
+    }
+  },
+  "environment_before": {
+    "python": {
+      "version": "3.10.12",
+      "executable": "/home/eran/venvs/torch/bin/python",
+      "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.35"
+    },
+    "torch": {
+      "version": "2.6.0+cu124",
+      "cuda_runtime": "12.4",
+      "cuda_available": true,
+      "cudnn_version": 90100
+    },
+    "tools": {
+      "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2024 NVIDIA Corporation\nBuilt on Tue_Feb_27_16:19:38_PST_2024\nCuda compilation tools, release 12.4, V12.4.99\nBuild cuda_12.4.r12.4/compiler.33961263_0",
+      "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0\nCopyright (C) 2021 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+      "g++": "g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0\nCopyright (C) 2021 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+      "cmake": "cmake version 3.22.1\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake).",
+      "ninja": "1.11.1.git.kitware.jobserver-1"
+    },
+    "packages": {
+      "transformers": "4.57.6",
+      "safetensors": "0.8.0",
+      "tokenizers": "0.22.2"
+    },
+    "nvidia_smi": "NVIDIA GeForce RTX 3060 Laptop GPU, 616.64, 6144, 4796, 1199, P3, 61, 397, 6001, 25.88, [N/A]",
+    "cuda_devices": [
+      {
+        "index": 0,
+        "name": "NVIDIA GeForce RTX 3060 Laptop GPU",
+        "compute_capability": "8.6",
+        "total_memory_bytes": 6441926656,
+        "free_memory_bytes": 5366611968
+      }
+    ],
+    "git_commit": "7f4c8444c34b78732775f8df86582e5c7f4075ce",
+    "git_dirty": false
+  },
+  "environment_after": {
+    "python": {
+      "version": "3.10.12",
+      "executable": "/home/eran/venvs/torch/bin/python",
+      "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.35"
+    },
+    "torch": {
+      "version": "2.6.0+cu124",
+      "cuda_runtime": "12.4",
+      "cuda_available": true,
+      "cudnn_version": 90100
+    },
+    "tools": {
+      "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2024 NVIDIA Corporation\nBuilt on Tue_Feb_27_16:19:38_PST_2024\nCuda compilation tools, release 12.4, V12.4.99\nBuild cuda_12.4.r12.4/compiler.33961263_0",
+      "gcc": "gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0\nCopyright (C) 2021 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+      "g++": "g++ (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0\nCopyright (C) 2021 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+      "cmake": "cmake version 3.22.1\n\nCMake suite maintained and supported by Kitware (kitware.com/cmake).",
+      "ninja": "1.11.1.git.kitware.jobserver-1"
+    },
+    "packages": {
+      "transformers": "4.57.6",
+      "safetensors": "0.8.0",
+      "tokenizers": "0.22.2"
+    },
+    "nvidia_smi": "NVIDIA GeForce RTX 3060 Laptop GPU, 616.64, 6144, 2746, 3249, P0, 74, 1702, 7001, 52.30, [N/A]",
+    "cuda_devices": [
+      {
+        "index": 0,
+        "name": "NVIDIA GeForce RTX 3060 Laptop GPU",
+        "compute_capability": "8.6",
+        "total_memory_bytes": 6441926656,
+        "free_memory_bytes": 3330277376
+      }
+    ],
+    "git_commit": "7f4c8444c34b78732775f8df86582e5c7f4075ce",
+    "git_dirty": false
+  }
+}

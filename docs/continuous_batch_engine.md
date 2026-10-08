@@ -1,7 +1,8 @@
-# 最小 Continuous Batching Engine
+# Continuous Batching Engine（v1.1.0）
 
-本阶段把已有的 Scheduler、Paged KV Cache 和 Qwen ModelRunner 接成同步执行闭环。它已经
-能在每个 step 动态加入和移除请求，但还不是异步生产级 serving engine。
+Scheduler、Paged KV Cache 与 Qwen ModelRunner 已形成同步执行闭环。
+当前支持变长 packed Prefill、batched Paged Decode、动态加入/移除请求、
+请求级指标、失败回滚和完成释放。以下描述以 v1.1.0 源码为准。
 
 ## 控制平面与执行平面
 
@@ -18,7 +19,7 @@ Scheduler 不能直接操作 GPU tensor，否则调度策略会与模型实现�
 ```text
 schedule_step()
       │
-      ├─ 新请求：逐请求 Prefill ─┐
+      ├─ 新请求：packed Prefill ─┐
       │                           ├─ greedy argmax（GPU）
       └─ 旧请求：batched Decode ─┘
                                   │ 按 Scheduler 原顺序重排
@@ -32,13 +33,13 @@ schedule_step()
                         释放 finished blocks
 ```
 
-执行顺序与 Scheduler `items` 顺序可以不同，但结果归属不能不同。当前先逐请求执行 Prefill，
+执行顺序与 Scheduler `items` 顺序可以不同，但结果归属不能不同。当前先批量执行 packed Prefill，
 再把全部 Decode 请求组成一个 Paged batch；最后必须按原始 `items` 顺序拼接 token。
 
 ## 为什么 Prefill 必须先于 Decode
 
-一个 mixed step 可能同时包含旧请求 Decode 和新请求 Prefill。当前 ModelRunner 尚不支持把
-两种形状放进同一次 forward，因此 Engine 要发起多个模型调用。为获得可重试语义：
+一个 mixed step 可能同时包含旧请求 Decode 和新请求 Prefill。当前 ModelRunner 将
+两种形状分为独立模型调用。为获得可重试语义：
 
 1. 新请求 Prefill 先执行；成功结果暂不写回 Scheduler。
 2. 旧请求 Decode 最后执行，它自身具有跨请求、跨层事务。
@@ -64,9 +65,15 @@ stream、event 和双缓冲隐藏这段开销，本阶段不提前实现。
 ## 当前边界
 
 - 只支持 greedy decoding，不支持 temperature、top-k/top-p。
-- Prefill 仍逐请求执行，不支持 chunked/continuous prefill。
+- Prefill 已支持变长 packed batch；不支持 chunked prefill。
 - 一个 `step()` 是同步调用，没有 CPU/GPU overlap。
-- 尚未记录 TTFT、TPOT 或吞吐量；不能从功能测试推断性能提升。
+- 已有请求级 TTFT、TPOT、E2E 与吞吐统计，正式数据保留 source commit。
+- Admission 保守预留全生命周期 blocks；无 preemption 或按需增长准入策略。
+
+Prefill 默认使用 vectorized KV write；Attention 的 `auto` 在 masked 与
+segmented SDPA 之间按形状选择。数据流与局限见
+[Prefill Backends](prefill_attention_backends.md)。正式结果见
+[公开 benchmark 摘录](benchmarks/README.md)，功能 gate 与性能测试分开解释。
 
 验证命令：
 
