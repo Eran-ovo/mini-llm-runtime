@@ -71,3 +71,27 @@ def _paged_decode_attention_cuda(
         scale,
         validate_metadata,
     )
+
+
+def _paged_decode_attention_split_cuda(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    *,
+    num_splits: int,
+    validate_metadata: bool,
+    scale: float | None = None,
+) -> torch.Tensor:
+    attention_scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
+    return load_cuda_extension().paged_decode_attention_split(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        sequence_lengths,
+        attention_scale,
+        num_splits,
+        validate_metadata,
+    )

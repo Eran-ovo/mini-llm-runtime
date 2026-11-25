@@ -3,9 +3,23 @@
 from __future__ import annotations
 
 import os
+import shutil
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
+
+
+@lru_cache(maxsize=1)
+def cuda_toolkit_available() -> bool:
+    """Prefill 在只有 PyTorch CUDA 环境时仍可使用 PyTorch 算子。"""
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    executable = "nvcc.exe" if os.name == "nt" else "nvcc"
+    return (
+        CUDA_HOME is not None
+        and (Path(CUDA_HOME) / "bin" / executable).is_file()
+        and shutil.which("ninja") is not None
+    )
 
 
 @lru_cache(maxsize=1)
@@ -18,6 +32,7 @@ def load_cuda_extension() -> ModuleType:
     repo_root = Path(__file__).resolve().parents[2]
     sources = [
         repo_root / "csrc" / "paged_attention_binding.cpp",
+        repo_root / "csrc" / "decode_elementwise_cuda.cu",
         repo_root / "csrc" / "paged_attention_cuda.cu",
         repo_root / "csrc" / "paged_attention_split_cuda.cu",
     ]

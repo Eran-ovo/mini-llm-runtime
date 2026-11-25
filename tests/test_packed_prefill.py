@@ -1,11 +1,17 @@
+from dataclasses import replace
+
 import pytest
 import torch
 
+import mini_llm_runtime.qwen_model_runner as model_runner_module
 from mini_llm_runtime.paged_batch import PagedBatchPrefillAdapter
 from mini_llm_runtime.paged_kv_adapter import PagedRequestKVCache
 from mini_llm_runtime.paged_kv_manager import PagedKVCacheManager
+from mini_llm_runtime.qwen_model_runner import QwenPrefillRunner
+from mini_llm_runtime.qwen_weights import QwenWeights
 
 from test_qwen_prefill_cache import make_runner
+from test_qwen_weights import tiny_config, tiny_state_dict
 
 
 PROMPTS = {
@@ -98,6 +104,75 @@ def test_packed_prefill_rejects_unknown_attention_backend_before_mutation():
         )
     assert manager.get_request("A").pending is None
     assert manager.allocator.free_count == manager.allocator.total_blocks
+
+
+def test_batched_sdpa_rejects_ragged_lengths_before_mutation():
+    runner, _ = make_runner()
+    manager = make_manager(runner)
+    for request_id in ("A", "B"):
+        manager.create_request(request_id)
+    cache = PagedBatchPrefillAdapter(manager, ("A", "B"), (2, 1))
+    with pytest.raises(ValueError, match="等长"):
+        runner.prefill_batch(torch.tensor([[1, 2, 3]]), cache=cache, attention_backend="batched_sdpa")
+    assert not cache.active
+    assert manager.allocator.free_count == manager.allocator.total_blocks
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
+def test_batched_prefill_graph_matches_eager_and_updates_physical_slots(monkeypatch):
+    config = replace(tiny_config(), hidden_size=128, intermediate_size=128)
+    state = {
+        name: (tensor * 0.1).to(device="cuda", dtype=torch.float16)
+        for name, tensor in tiny_state_dict(config).items()
+    }
+    weights = QwenWeights.from_state_dict(config, state)
+    eager = QwenPrefillRunner(config, weights)
+    graph = QwenPrefillRunner(config, weights, enable_prefill_cuda_graph=True)
+    eager_manager, graph_manager = make_manager(eager), make_manager(graph)
+    retained = None
+
+    for trial in range(3):
+        order = ("A", "B") if trial < 2 else ("B", "A")
+        # 在每轮占用不同数量的页，使捕获与重放使用不同的物理 slot。
+        for manager in (eager_manager, graph_manager):
+            manager.create_request("guard")
+            if trial:
+                manager.reserve_request_capacity("guard", trial * manager.block_size)
+            for request_id in order:
+                manager.create_request(request_id)
+        tokens = torch.tensor(
+            [[(token + trial) % config.vocab_size for token in (1, 2, 3, 4, 0, 1)]],
+            device="cuda",
+        )
+        with monkeypatch.context() as reference:
+            reference.setattr(model_runner_module, "cuda_toolkit_available", lambda: False)
+            expected = eager.prefill_batch(
+                tokens,
+                cache=PagedBatchPrefillAdapter(eager_manager, order, (3, 3), write_backend="scalar"),
+                attention_backend="segmented_sdpa",
+            )
+        actual = graph.prefill_batch(
+            tokens, cache=PagedBatchPrefillAdapter(graph_manager, order, (3, 3)),
+            attention_backend="batched_sdpa",
+        )
+        torch.testing.assert_close(actual.logits, expected.logits, rtol=2e-3, atol=2e-3)
+        for request_id in order:
+            torch.testing.assert_close(
+                graph_manager.gather(request_id),
+                eager_manager.gather(request_id),
+                rtol=2e-3, atol=2e-3,
+            )
+        if trial == 1:
+            retained = (actual.logits, actual.logits.clone(), tokens, tokens.clone())
+        for manager in (eager_manager, graph_manager):
+            for request_id in (*order, "guard"):
+                manager.release_request(request_id)
+
+    assert retained is not None
+    logits, original_logits, tokens, original_tokens = retained
+    torch.testing.assert_close(logits, original_logits, rtol=0, atol=0)
+    torch.testing.assert_close(tokens, original_tokens)
+    assert any(item is not None for item in graph._prefill_graphs[graph_manager].values())
 
 
 @pytest.mark.parametrize("write_backend", ["scalar", "vectorized"])

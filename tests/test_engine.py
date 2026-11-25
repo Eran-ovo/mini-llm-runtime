@@ -146,11 +146,12 @@ def test_engine_packs_same_step_prefill_into_one_runner_call(
     ("lengths", "expected"),
     [
         ((8, 8, 8, 8), "masked"),
-        ((64, 64, 64, 64), "masked"),
-        ((128, 128, 128, 128), "segmented_sdpa"),
-        ((256, 256, 256, 256), "segmented_sdpa"),
-        ((64,) * 8, "segmented_sdpa"),
-        ((32,) * 16, "segmented_sdpa"),
+        ((32,) * 4, "batched_sdpa"),
+        ((64,) * 4, "batched_sdpa"),
+        ((128,) * 4, "batched_sdpa"),
+        ((256,) * 4, "batched_sdpa"),
+        ((64,) * 8, "batched_sdpa"),
+        ((32,) * 16, "batched_sdpa"),
         ((16,) * 32, "masked"),
         ((128,) + (13,) * 31, "segmented_sdpa"),
         ((8, 64, 128, 256), "masked"),
@@ -176,9 +177,9 @@ def test_explicit_prefill_backend_overrides_auto_shape() -> None:
 @pytest.mark.parametrize(
     ("request_count", "prompt_length", "expected_backend"),
     [
-        (4, 128, "segmented_sdpa"),
-        (8, 64, "segmented_sdpa"),
-        (16, 32, "segmented_sdpa"),
+        (4, 128, "batched_sdpa"),
+        (8, 64, "batched_sdpa"),
+        (16, 32, "batched_sdpa"),
         (32, 16, "masked"),
     ],
 )
@@ -387,6 +388,86 @@ def test_mixed_step_decode_failure_restores_scheduler_and_new_prefill(
     # 失败尝试本身也是时间线事实；没有产生虚假的 token event。
     assert len(engine.metrics.snapshot("B").prefill_attempt_started_ns) == 2
     assert len(engine.metrics.snapshot("B").token_events) == 1
+
+
+def test_oversized_submit_leaves_other_requests_schedulable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, scheduler, admission = make_engine(monkeypatch)
+    engine.submit("A", (1, 2), max_new_tokens=2)
+
+    with pytest.raises(ValueError, match="永久无法接纳"):
+        engine.submit("B", (3,), max_new_tokens=25)
+
+    assert scheduler.waiting_request_ids == ("A",)
+    assert engine.metrics.request_ids == ("A",)
+    assert admission.reservations == ()
+    assert engine.step() is not None
+    assert engine.step() is not None
+    assert not scheduler.has_unfinished_requests
+
+
+def test_later_admission_failure_rolls_back_reservations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, scheduler, admission = make_engine(monkeypatch)
+    engine.submit("A", (1, 2), max_new_tokens=2)
+    engine.submit("B", (3,), max_new_tokens=2)
+    reserve = admission.manager.reserve_request_capacity
+
+    def fail_second(request_id: str, token_capacity: int):
+        if request_id == "B":
+            raise RuntimeError("injected admission failure")
+        return reserve(request_id, token_capacity)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(admission.manager, "reserve_request_capacity", fail_second)
+        with pytest.raises(RuntimeError, match="injected admission failure"):
+            engine.step()
+
+    assert scheduler.running_request_ids == ()
+    assert scheduler.waiting_request_ids == ("A", "B")
+    assert scheduler.outstanding_batch is None
+    assert admission.reservations == ()
+    assert admission.manager.request_ids == ()
+    result = engine.step()
+    assert result is not None
+    assert result.batch.step_index == 0
+    assert result.batch.prefill_request_ids == ("A", "B")
+
+
+def test_mixed_step_token_transfer_failure_keeps_decode_append_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, scheduler, admission = make_engine(monkeypatch)
+    active = engine.submit("A", (1, 2), max_new_tokens=3)
+    assert engine.step() is not None
+    table = admission.manager.get_request("A")
+    engine.submit("B", (3,), max_new_tokens=2)
+    transfer = torch.Tensor.cpu
+
+    def fail_at_token_transfer(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.dtype == torch.long and tensor.ndim == 1:
+            assert table.token_count == 2
+            assert table.pending is not None
+            raise RuntimeError("injected token transfer failure")
+        return transfer(tensor)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(torch.Tensor, "cpu", fail_at_token_transfer)
+        with pytest.raises(RuntimeError, match="injected token transfer failure"):
+            engine.step()
+
+    assert table.token_count == 2
+    assert table.pending is None
+    assert len(active.generated_token_ids) == 1
+    assert scheduler.outstanding_batch is None
+    assert scheduler.waiting_request_ids == ("B",)
+    assert admission.manager.request_ids == ("A",)
+    retried = engine.step()
+    assert retried is not None
+    assert retried.batch.step_index == 1
+    assert table.token_count == 3
 
 
 def test_static_engine_does_not_refill_until_cohort_finishes(

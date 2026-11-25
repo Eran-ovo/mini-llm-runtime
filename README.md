@@ -19,6 +19,8 @@ CUDA decode attention, and continuous batching.
 在 **RTX 3060 Laptop 6 GB** 上运行 `Qwen/Qwen2.5-0.5B` FP16，
 覆盖一次请求从入队、Prefill、逐 token Decode 到 KV 回收的完整生命周期。
 模型计算由自有 ModelRunner 编排；Hugging Face 用作 tokenizer 与外部 correctness oracle。
+同卡交错测试中，三组固定负载的输出吞吐中位数比 vLLM 0.8.5 V1 高 **2.2%–14.1%**。
+见 [测试配置与结果](#与-vllm-同机对照)。
 
 | 层次 | 独立实现的能力 |
 |---|---|
@@ -28,9 +30,9 @@ CUDA decode attention, and continuous batching.
 | **动态批处理** | 变长 packed Prefill、batched Decode、waiting/running/finished 状态机；Decode-priority 与 request/token/block budget |
 | **验证与测量** | HF token/logits/KV 对拍；TTFT、TPOT、吞吐、尾延迟与显存；CUDA Event、raw samples、clean-tree release bundle |
 
-底层 GEMM、Norm、RoPE 与 Prefill attention 使用 PyTorch/cuBLAS/SDPA。
-Paged KV 写入提供 PyTorch scalar/vectorized 路径；手写 CUDA 核心是 Decode Attention。
-这让模型正确性、存储生命周期和 CUDA 地址映射可以分别验证。
+线性层使用 PyTorch/cuBLAS，Prefill Attention 使用 PyTorch matmul 或 SDPA。
+自定义 CUDA 算子覆盖 Paged Attention、RMSNorm、SwiGLU 和 RoPE/KV 写入，
+保留 PyTorch 路径用于逐层对拍和 KV 写入验证。
 
 ## 运行架构
 
@@ -53,9 +55,13 @@ flowchart TD
 ```
 
 - **Prefill**：处理有效 prompt token，创建各层 KV，产出首 token。
-  `auto` 在 dense block-diagonal mask 与 segmented SDPA 之间按形状选择。
+  `auto` 对达到阈值的等长 prompt 使用 batched causal SDPA，对变长 prompt
+  按形状选择 dense block-diagonal mask 或 segmented SDPA。FP16 批量路径可用
+  CUDA 融合 RMSNorm、SwiGLU 以及 vectorized KV 写入时的 RoPE。
 - **Decode**：逐请求 position 延续，只计算新 token；每层一次 batched Paged Attention，
-  从 block table 读取历史 KV。
+  从 block table 读取历史 KV。FP16 batched Decode 合并 Q/K RoPE 与 KV 写入，
+  position、物理 slot 和 block table 共用一次 H2D 传输。
+  Warp 并行 Attention 在单分区时直接输出，多分区时额外合并 FP32 softmax 状态。
 - **Continuous Batching**：每 step 移除完成请求，并用剩余预算接纳 waiting 请求。
   当前 Engine 同步执行 `Prefill → Decode → D2H → commit/release`。
 - **Paged KV**：逻辑 token 与物理页解耦，完成时归还 blocks。
@@ -76,9 +82,27 @@ K/V layout: [layer, physical_block, kv_head, block_offset, head_dim]
 
 ## 实测结果
 
-**统一硬件背景：RTX 3060 Laptop / Ampere sm_86 / 6 GB，WSL2 Ubuntu 22.04，
-CUDA 12.4，PyTorch 2.6.0+cu124，Qwen2.5-0.5B FP16。**
-以下来自既有正式 clean-tree benchmark，源码版本分别绑定到各自 commit。
+**RTX 3060 Laptop 6 GB（Ampere sm_86）、WSL2 Ubuntu 22.04、CUDA 12.4、
+PyTorch 2.6.0+cu124、Qwen2.5-0.5B FP16。**
+
+### 与 vLLM 同机对照
+
+两边使用相同的预分词 token ID、greedy 解码和每请求固定输出 32 token。
+每组预热 3 轮，正式交错测量 12 轮，轮换执行顺序。mini 启用 Prefill/Decode CUDA Graph，
+vLLM 使用 0.8.5 V1、CUDA Graph，关闭前缀缓存。调度上限为 8 个运行请求和每步 4096 token。
+
+| 并发 × 输入 token | mini 吞吐中位数 | vLLM 吞吐中位数 | mini 相对增幅 | 配对胜场 |
+|---|---:|---:|---:|---:|
+| 4 × 32 | **549.7 tok/s** | 481.8 tok/s | **+14.1%** | 12/12 |
+| 8 × 256 | **668.0 tok/s** | 632.4 tok/s | **+5.6%** | 11/12 |
+| 1 × 2048 | **80.6 tok/s** | 78.8 tok/s | **+2.2%** | 10/12 |
+
+计时窗口从提交请求到引擎返回最后一个 token，跳过模型加载、预热、tokenizer 和 HTTP。
+长上下文组的 TTFT 中位数为 146.5 ms（mini）和 144.0 ms（vLLM）。
+结果适用于上述单 GPU、固定 burst 设置。采样运行于包含优化的本地工作区。
+
+[12 轮原始样本与顺序](docs/benchmarks/vllm-interleaved.json) ·
+[测量细节](docs/benchmarks/README.md#与-vllm-同机交错) · [复现命令](#复现-vllm-交错对照)
 
 ### Continuous vs Static Batching
 
@@ -179,10 +203,33 @@ python scripts/benchmark_packed_prefill.py \
 在当前 HEAD 复现得到的是当前版本结果；复核历史数字须使用对应 source commit。
 完整参数与归档语义见 [Release Evaluation](docs/release_evaluation.md)。
 
+### 复现 vLLM 交错对照
+
+在 mini 环境运行下列命令。脚本启动独立的 vLLM Python 进程，两个引擎同时驻留，
+依次占用同一张 GPU。使用同一份本地 Qwen checkpoint。已验证的 vLLM 环境为
+`vllm==0.8.5`、`transformers==4.51.3` 和 PyTorch 2.6。脚本记录逐轮样本、顺序、
+吞吐、TTFT、TPOT、ITL 和生成 token 的 SHA-256。
+[基准脚本](scripts/benchmark_vllm.py) · [vLLM GPU 安装文档](https://docs.vllm.ai/en/v0.8.5/getting_started/installation/gpu.html)
+
+```bash
+MODEL_DIR=/path/to/local/Qwen2.5-0.5B
+VLLM_PYTHON=/path/to/vllm-venv/bin/python
+
+OMP_NUM_THREADS=2 python scripts/benchmark_vllm.py --backend mini \
+  --interleave-with "$VLLM_PYTHON" --model "$MODEL_DIR" \
+  --mini-cuda-graph --mini-prefill-cuda-graph --gpu-memory-utilization 0.40 \
+  --warmup 3 --repeats 12 --output benchmarks/results/vllm_interleaved.json
+```
+
+ModelRunner 通过 `enable_decode_cuda_graph=True` 和 `enable_prefill_cuda_graph=True`
+分别启用 Decode 和 Prefill 图重放。Engine 的 Decode 图也包含 greedy argmax，
+随后按批次回传 token ID。Prefill 图目前适用于总计不超过 512 token 的
+等长、vectorized KV 写入批次。图按 KV 池和输入形状缓存，基准默认用两轮预热完成捕获。
+
 ## 正确性与工程质量
 
-v1.1.0 的全量测试记录为 **280 passed**；
-测试与真实模型 oracle 分开运行，避免普通回归依赖下载权重。
+当前主分支的全量回归为 **296 passed**，真实 Qwen 的 Hugging Face 对拍也通过。
+单元测试与真实模型 oracle 分开运行，普通回归可在本地独立执行。
 
 | 验证层次 | 覆盖重点 |
 |---|---|
@@ -226,8 +273,8 @@ HTML 文档可在本地直接打开，或从仓库根目录运行 `python -m htt
 
 ## 当前边界与后续方向
 
-单 GPU、FP16、greedy；Decode CUDA kernel 当前支持 `head_dim=64`，
-以正确性优先，sequence 维仍串行扫描。
+单 GPU、FP16、greedy。Decode CUDA kernel 当前支持 `head_dim=64`，
+按 batch 和上下文形状选择基础 Paged Attention 或 split-KV。
 同步 Engine 采用 whole-prefill、strict FIFO 和保守全生命周期 block reservation。
 尚不支持 chunked prefill、preemption、异步 CPU/GPU overlap、prefix caching、
 量化、分布式推理或 Speculative Decoding。

@@ -1,7 +1,6 @@
 # 首页性能数据与可复核样本
 
-这里提交轻量的正式 benchmark 摘录，让 GitHub 读者无需下载模型即可核对首页数字。
-它们来自已有原始 JSON，不是这次文档整理期间新运行的 benchmark。
+这里保留首页实验的原始样本摘录、配置和计算口径，便于直接核对结果。
 
 ## 来源
 
@@ -10,7 +9,7 @@
 | [static-continuous.json](static-continuous.json) | `release_v1_d31ded2/static_vs_continuous/result.json` | `d31ded234702d9f51d419d8c2d200e51c5994950` |
 | [prefill-4x512.json](prefill-4x512.json) | `v2_4_attention_len512_clean_7f4c844/result.json` | `7f4c8444c34b78732775f8df86582e5c7f4075ce` |
 
-摘录保留测试参数、correctness、原始 latency/memory 样本、统计结果、
+这两份历史摘录保留测试参数、correctness、原始 latency/memory 样本、统计结果、
 GPU/CUDA/PyTorch/编译器环境和 `git_dirty=false`。
 `provenance` 保存原始完整文件的相对路径、SHA-256 和保留字段，
 明确省略逐 step 轨迹或 prompt token buffer；没有更改测量值。
@@ -19,6 +18,30 @@ GPU/CUDA/PyTorch/编译器环境和 `git_dirty=false`。
 [Release evidence asset](https://github.com/Eran-ovo/mini-llm-runtime/releases/download/v1.0.0/mini-llm-runtime-v1.0.0-release-evidence.tar.gz)。
 Prefill 完整原始 JSON 当前保存在作者本地结果目录；本页公开其计算结论所需样本，
 复现命令见下文。
+
+## 与 vLLM 同机交错
+
+[vllm-interleaved.json](vllm-interleaved.json) 保留 2026-11-25 的全部逐轮样本。
+采样使用随本页发布的优化实现，运行时源码位于本地工作区。旧 mini、优化版和 vLLM
+在一张 RTX 3060 Laptop 6 GB 上依次运行，每组先各预热 3 轮，再正式交错测量 12 轮。
+归档包括每轮执行顺序、输入和输出 token 的 SHA-256，以及每轮开始前的 GPU 温度、
+SM 频率、功耗与显存占用快照。
+
+- 三组形状为 `4×32`、`8×256`、`1×2048`，每请求固定输出 32 token。输入通过
+  `random.Random(0)` 在每组内生成，ID 范围为 3–999。两边使用同一 checkpoint、
+  FP16 和 greedy 解码。
+- max running 为 8，单步 token budget 为 4096，block size 为 16。mini 的 KV 池为
+  144 块，vLLM 0.8.5 V1 使用 `gpu_memory_utilization=0.40`，启动后可用 KV 容量
+  为 18,240 token。vLLM 的前缀缓存关闭，两边启用 CUDA Graph。
+- 吞吐以输出 token 数除以从提交该轮请求到最后一个 token 返回的墙钟时间。
+  首页增幅为两个后端的 12 轮吞吐中位数之比减一。配对胜场统计同一轮中 mini
+  的吞吐更高的次数。TTFT 为每轮请求中位数，再对 12 轮取中位数。
+- 采样量的是本地推理引擎的固定 burst。权重加载、预热、tokenizer、HTTP
+  和在线流量均在测量窗口之外。三组 mini 优化前后输出 token 一致，
+  `8×256` 组的 vLLM 输出 token 序列与 mini 有差异。
+
+[复现命令](../../README.md#复现-vllm-交错对照) 使用当前 mini 和 vLLM 双后端交错。
+归档中的 `prior-mini` 是当时的本地实现，用于观察优化前后的变化。
 
 ## 数字如何计算
 

@@ -32,10 +32,8 @@ class PagedBlockAdmissionController:
         except KeyError as error:
             raise KeyError(f"请求 {request_id!r} 尚未预留 block") from error
 
-    def try_admit(self, request: RequestState) -> bool:
-        """资源足够则原子创建 Cache request 并预留，否则无副作用返回 False。"""
-        if request.request_id in self._reservations:
-            raise RuntimeError(f"请求 {request.request_id!r} 已经完成 block 预留")
+    def validate_request_capacity(self, request: RequestState) -> int:
+        """校验单条请求能否放入整个 KV 池，返回所需 block 数。"""
         block_size = self.manager.block_size
         required_blocks = (
             request.max_cache_tokens + block_size - 1
@@ -45,6 +43,13 @@ class PagedBlockAdmissionController:
                 f"请求 {request.request_id!r} 永久无法接纳：required_blocks="
                 f"{required_blocks}, total_blocks={self.manager.allocator.total_blocks}"
             )
+        return required_blocks
+
+    def try_admit(self, request: RequestState) -> bool:
+        """资源足够则原子创建 Cache request 并预留，否则无副作用返回 False。"""
+        if request.request_id in self._reservations:
+            raise RuntimeError(f"请求 {request.request_id!r} 已经完成 block 预留")
+        required_blocks = self.validate_request_capacity(request)
         if required_blocks > self.manager.allocator.free_count:
             return False
 

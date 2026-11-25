@@ -11,13 +11,14 @@ import torch
 
 from .block_admission import PagedBlockAdmissionController
 from .paged_batch import PagedBatchDecodeAdapter, PagedBatchPrefillAdapter
-from .qwen_model_runner import QwenPrefillRunner
+from .qwen_model_runner import PACKED_PREFILL_ATTENTION_BACKENDS, QwenPrefillRunner
 from .request_metrics import RequestMetricsCollector
 from .scheduler import (
     RequestScheduler,
     RequestState,
     SchedulerBatch,
     SchedulerStepUpdate,
+    WorkKind,
 )
 
 
@@ -50,15 +51,15 @@ def select_prefill_attention_backend(
     configured: str, lengths: Sequence[int]
 ) -> str:
     """根据本轮 prompt 形状选择 Attention；显式 backend 永远优先。"""
-    if configured not in {"auto", "masked", "segmented_sdpa"}:
-        raise ValueError("prefill_attention_backend 必须是 auto、masked 或 segmented_sdpa")
+    if configured != "auto" and configured not in PACKED_PREFILL_ATTENTION_BACKENDS:
+        raise ValueError("prefill_attention_backend 必须是 auto、masked、segmented_sdpa 或 batched_sdpa")
     if configured != "auto":
         return configured
     if not lengths or any(length <= 0 for length in lengths):
         raise ValueError("auto Prefill 需要非空且为正数的 prompt lengths")
     total_tokens = sum(lengths)
-    # 保留旧的“存在长 prompt”分支；新增平均长度分支覆盖 8×64、16×32。
-    # 32×16 的分段调用开销已抵消收益，因此不能只看总 token 数。
+    if total_tokens >= 128 and lengths[0] >= 32 and all(length == lengths[0] for length in lengths):
+        return "batched_sdpa"
     if total_tokens >= 512 and (
         max(lengths) >= 128 or total_tokens >= 32 * len(lengths)
     ):
@@ -87,9 +88,12 @@ class ContinuousBatchEngine:
     ) -> None:
         if runner.decode_attention_backend != "paged_cuda":
             raise ValueError("ContinuousBatchEngine 需要 paged_cuda ModelRunner")
-        if prefill_attention_backend not in {"auto", "masked", "segmented_sdpa"}:
+        if (
+            prefill_attention_backend != "auto"
+            and prefill_attention_backend not in PACKED_PREFILL_ATTENTION_BACKENDS
+        ):
             raise ValueError(
-                "prefill_attention_backend 必须是 auto、masked 或 segmented_sdpa"
+                "prefill_attention_backend 必须是 auto、masked、segmented_sdpa 或 batched_sdpa"
             )
         if prefill_kv_write_backend not in {"scalar", "vectorized"}:
             raise ValueError("prefill_kv_write_backend 必须是 scalar 或 vectorized")
@@ -143,6 +147,7 @@ class ContinuousBatchEngine:
             prompt_token_ids,
             max_new_tokens=max_new_tokens,
             eos_token_ids=eos_token_ids,
+            validate_request=self.admission.validate_request_capacity,
         )
         self.metrics.register_request(request_id, arrival_ns)
         return request
@@ -151,12 +156,14 @@ class ContinuousBatchEngine:
     def step(self) -> EngineStepResult | None:
         """调度并执行一步；无可运行工作时返回 None。
 
-        新 Prefill 先执行，旧请求 Decode 后执行。若任一模型调用失败，Decode 自身
-        事务先回滚，随后 Engine 释放本轮 Prefill reservation 并撤销 Scheduler batch。
+        新 Prefill 先执行，旧请求 Decode 后执行。取回 token 后才提交 Decode。
+        执行或取回结果失败时，Engine 撤销 Decode append、Prefill 预留与 Scheduler batch。
         """
         started_ns = self._clock_ns()
         with _nvtx_range(self.enable_nvtx, "scheduler.schedule_step"):
-            batch = self.scheduler.schedule_step()
+            batch = self.scheduler.schedule_step(
+                rollback_admissions=self.admission.release_admitted
+            )
         if batch is None:
             return None
         message = (
@@ -172,16 +179,17 @@ class ContinuousBatchEngine:
     ) -> EngineStepResult:
         """执行已经选好的 Scheduler batch；由 `step()` 负责创建外层 NVTX range。"""
 
-        # request_id -> GPU scalar token。最后按 batch.items 顺序一次性同步回 CPU。
-        selected_tokens: dict[str, torch.Tensor] = {}
+        selected_ids: list[str] = []
+        selected_tokens: list[torch.Tensor] = []
         prefill_ids = batch.prefill_request_ids
         selected_prefill_backend: str | None = None
+        decode_cache = None
         try:
             self.metrics.require_registered(
                 tuple(item.request_id for item in batch.items)
             )
             prefill_items = tuple(
-                item for item in batch.items if item.request_id in prefill_ids
+                item for item in batch.items if item.kind is WorkKind.PREFILL
             )
             if prefill_items:
                 prefill_lengths = tuple(len(item.input_token_ids) for item in prefill_items)
@@ -207,7 +215,6 @@ class ContinuousBatchEngine:
                         dtype=torch.long,
                         device=self.runner.weights.embedding.device,
                     )
-                    prefill_ids = tuple(item.request_id for item in prefill_items)
                     adapter = PagedBatchPrefillAdapter(
                         self.manager,
                         prefill_ids,
@@ -219,14 +226,13 @@ class ContinuousBatchEngine:
                         cache=adapter,
                         attention_backend=selected_prefill_backend,
                     )
-                    prefill_tokens = output.logits[:, -1].argmax(dim=-1)
-                    for index, request_id in enumerate(prefill_ids):
-                        selected_tokens[request_id] = prefill_tokens[index : index + 1]
+                    selected_ids.extend(prefill_ids)
+                    selected_tokens.append(output.logits[:, -1].argmax(dim=-1))
 
             decode_items = tuple(
                 item
                 for item in batch.items
-                if item.request_id in batch.decode_request_ids
+                if item.kind is WorkKind.DECODE
             )
             if decode_items:
                 decode_ids = tuple(item.request_id for item in decode_items)
@@ -239,31 +245,35 @@ class ContinuousBatchEngine:
                         dtype=torch.long,
                         device=self.runner.weights.embedding.device,
                     )
-                    output = self.runner.decode_batch(
+                    decode_cache = PagedBatchDecodeAdapter(self.manager, decode_ids)
+                    decode_tokens = self.runner.decode_batch_greedy(
                         token_ids,
-                        cache=PagedBatchDecodeAdapter(self.manager, decode_ids),
+                        cache=decode_cache,
+                        defer_commit=True,
                     )
-                    decode_tokens = output.logits[:, -1].argmax(dim=-1)
-                    for index, request_id in enumerate(decode_ids):
-                        selected_tokens[request_id] = decode_tokens[index : index + 1]
+                    selected_ids.extend(decode_ids)
+                    selected_tokens.append(decode_tokens)
+
+            # 两阶段共享一次 D2H，Scheduler 写回时按原始 batch 的顺序发出事件。
+            with _nvtx_range(self.enable_nvtx, "token.d2h_sync"):
+                tokens = (
+                    selected_tokens[0] if len(selected_tokens) == 1
+                    else torch.cat(selected_tokens)
+                )
+                cpu_tokens = tokens.cpu().tolist()
+            tokens_ready_ns = self._clock_ns()
+            generated = dict(zip(selected_ids, cpu_tokens, strict=True))
+            if decode_cache is not None:
+                decode_cache.commit_decode()
         except Exception:
             # Prefill 请求均为本 step 新接纳，释放后可从空 Cache 完整重试。
             with _nvtx_range(self.enable_nvtx, "engine.rollback"):
+                if decode_cache is not None and decode_cache.active:
+                    decode_cache.abort_decode()
                 self.admission.release_admitted(prefill_ids)
                 self.scheduler.abort_step()
             raise
 
-        # 按 Scheduler 原始顺序拼接，避免执行顺序（Prefill→Decode）改变结果归属。
-        with _nvtx_range(self.enable_nvtx, "token.d2h_sync"):
-            ordered_gpu_tokens = torch.cat(
-                [selected_tokens[item.request_id] for item in batch.items]
-            )
-            ordered_cpu_tokens = ordered_gpu_tokens.cpu().tolist()
-        tokens_ready_ns = self._clock_ns()
-        generated = {
-            item.request_id: int(token)
-            for item, token in zip(batch.items, ordered_cpu_tokens, strict=True)
-        }
         with _nvtx_range(self.enable_nvtx, "scheduler.apply_and_release"):
             update = self.scheduler.apply_step_results(generated)
             released = self.admission.release_finished(update.finished_request_ids)

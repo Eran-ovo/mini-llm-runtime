@@ -103,12 +103,13 @@ class _MutableTimeline:
 
     @property
     def last_event_ns(self) -> int:
-        candidates = [self.arrival_ns]
-        candidates.extend(self.prefill_attempt_started_ns)
-        candidates.extend(event.ready_ns for event in self.token_events)
         if self.completed_ns is not None:
-            candidates.append(self.completed_ns)
-        return max(candidates)
+            return self.completed_ns
+        if self.token_events:
+            return self.token_events[-1].ready_ns
+        if self.prefill_attempt_started_ns:
+            return self.prefill_attempt_started_ns[-1]
+        return self.arrival_ns
 
 
 class RequestMetricsCollector:

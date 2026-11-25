@@ -171,6 +171,7 @@ class RequestScheduler:
         *,
         max_new_tokens: int,
         eos_token_ids: int | Collection[int] | None = None,
+        validate_request: Callable[[RequestState], object] | None = None,
     ) -> RequestState:
         """把新请求追加到 waiting 队尾；GPU batch 执行期间也允许到达。"""
         if not request_id:
@@ -197,13 +198,20 @@ class RequestScheduler:
             eos_token_ids=eos,
             arrival_index=self._next_arrival_index,
         )
+        if validate_request is not None:
+            validate_request(request)
         self._next_arrival_index += 1
         self._requests[request_id] = request
         self._waiting.append(request_id)
         return request
 
-    def schedule_step(self) -> SchedulerBatch | None:
-        """先调度全部 running Decode，再用剩余 budget 严格 FIFO 接纳 Prefill。"""
+    def schedule_step(
+        self, *, rollback_admissions: Callable[[tuple[str, ...]], object] | None = None
+    ) -> SchedulerBatch | None:
+        """先安排 Decode，再以剩余 budget 按 FIFO 准入 Prefill。
+
+        外部准入回调预留的资源由 `rollback_admissions` 在同轮后续准入失败时回收。
+        """
         if self._outstanding is not None:
             raise RuntimeError("上一个 Scheduler batch 尚未写回结果")
         if not self._running and not self._waiting:
@@ -237,43 +245,45 @@ class RequestScheduler:
         # 这个计数只统计本 mixed step 新接纳的 prompt token，不包含 Decode token，
         # 也不影响没有历史 running 请求的初始 cohort。
         mixed_prefill_tokens = 0
-        while may_admit_prefill and self._waiting and available_slots > 0:
-            request_id = self._waiting[0]
-            request = self._requests[request_id]
-            prompt_cost = len(request.prompt_token_ids)
-            # strict FIFO：队首放不下时停止，不能越过它选择更短的后续请求。
-            if token_count + prompt_cost > self.max_batch_tokens:
-                break
-            if (
-                running_at_step_start
-                and self.max_mixed_prefill_tokens is not None
-                and mixed_prefill_tokens + prompt_cost
-                > self.max_mixed_prefill_tokens
-            ):
-                # whole-prefill + strict FIFO：不切 prompt，也不越过队首挑短请求。
-                # 当旧 cohort 排空后，该限制不再生效，因此大 prompt 不会永久饥饿。
-                break
-            # callback 必须保证：返回 False 时无副作用；返回 True 时资源已经
-            # 原子预留。资源不足同样遵守 strict FIFO，不跳过队首请求。
-            if (
-                self._admission_callback is not None
-                and not self._admission_callback(request)
-            ):
-                break
-            self._waiting.popleft()
-            request.status = RequestStatus.RUNNING
-            self._running.append(request_id)
-            items.append(
-                ScheduledRequest(
-                    request_id=request_id,
-                    kind=WorkKind.PREFILL,
-                    input_token_ids=request.prompt_token_ids,
+        admitted_ids: list[str] = []
+        try:
+            for request_id in self._waiting if may_admit_prefill else ():
+                if available_slots == 0:
+                    break
+                request = self._requests[request_id]
+                prompt_cost = len(request.prompt_token_ids)
+                # strict FIFO：队首放不下时停止，不能越过它选择更短的后续请求。
+                if token_count + prompt_cost > self.max_batch_tokens:
+                    break
+                if (
+                    running_at_step_start
+                    and self.max_mixed_prefill_tokens is not None
+                    and mixed_prefill_tokens + prompt_cost > self.max_mixed_prefill_tokens
+                ):
+                    # 旧 cohort 排空后，该限制不再生效。
+                    break
+                # False 表示暂时放不下且无副作用，True 表示已原子预留。
+                if (
+                    self._admission_callback is not None
+                    and not self._admission_callback(request)
+                ):
+                    break
+                admitted_ids.append(request_id)
+                items.append(
+                    ScheduledRequest(
+                        request_id=request_id,
+                        kind=WorkKind.PREFILL,
+                        input_token_ids=request.prompt_token_ids,
+                    )
                 )
-            )
-            token_count += prompt_cost
-            if running_at_step_start:
-                mixed_prefill_tokens += prompt_cost
-            available_slots -= 1
+                token_count += prompt_cost
+                if running_at_step_start:
+                    mixed_prefill_tokens += prompt_cost
+                available_slots -= 1
+        except Exception:
+            if admitted_ids and rollback_admissions is not None:
+                rollback_admissions(tuple(admitted_ids))
+            raise
 
         if not items:
             # waiting 可能因外部 block budget 暂时无法接纳；队列保持不变。
@@ -283,6 +293,10 @@ class RequestScheduler:
             items=tuple(items),
             token_count=token_count,
         )
+        for request_id in admitted_ids:
+            self._waiting.popleft()
+            self._requests[request_id].status = RequestStatus.RUNNING
+        self._running.extend(admitted_ids)
         self._next_step_index += 1
         self._outstanding = batch
         return batch

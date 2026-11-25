@@ -59,6 +59,15 @@ def test_split_long_context_and_nondefault_stream():
     torch.testing.assert_close(v1, expected, atol=2e-3, rtol=2e-3)
 
 
+@pytest.mark.parametrize("block_size", [7, 16])
+def test_split_warps_cover_ragged_batch_without_reading_tail(block_size):
+    args = make_case([129, 192, 255, 256, 257, 271, 280, 287], block_size=block_size)
+    actual = split_kv_attention(*args, num_splits=4)
+    expected = paged_decode_attention_reference(*args).output
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+
+
 def test_merge_uses_global_weights_not_average_of_partition_outputs():
     args = make_case([2], hq=1, hkv=1, block_size=1)
     q, k, v, table, _ = args

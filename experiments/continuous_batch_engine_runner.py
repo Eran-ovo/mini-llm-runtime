@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-size", type=int, default=4)
     parser.add_argument(
         "--prefill-attention-backend",
-        choices=("auto", "masked", "segmented_sdpa"),
+        choices=("auto", "masked", "segmented_sdpa", "batched_sdpa"),
         default="auto",
     )
     parser.add_argument(
