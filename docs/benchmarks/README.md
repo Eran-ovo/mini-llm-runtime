@@ -43,6 +43,35 @@ SM 频率、功耗与显存占用快照。
 [复现命令](../../README.md#复现-vllm-交错对照) 使用当前 mini 和 vLLM 双后端交错。
 归档中的 `prior-mini` 是当时的本地实现，用于观察优化前后的变化。
 
+## 错峰变长 Prefill 对照
+
+RTX 3060 Laptop 6 GB、PyTorch 2.6.0+cu124、Qwen2.5-0.5B FP16。
+四个后端各预热 3 轮，按轮换顺序交错测量 12 轮。两引擎均使用
+160 个 16-token KV blocks、8 个运行请求上限、每步 4096 token 预算和 CUDA Graph。
+每轮先提交 4 条 64-token prompt，各生成 48 token。计划到达时间 60 ms
+的三条 prompt 长度为 128、512、1024，各生成 32 token。
+所有测量轮次都在首批请求仍在 Decode 时提交了三条后到请求。
+[复现命令](../../README.md#变长-prefill-与错峰请求) · [逐轮样本](vllm-varlen-mixed.json)
+
+| 后端 | 输出 tok/s | 后到请求 P95 TTFT | 首批 P95 ITL | 首批最大 ITL | 达标 req/s |
+|---|---:|---:|---:|---:|---:|
+| mini `auto` | 465.8 | 125.2 ms | 17.1 ms | 121.9 ms | 4.85 |
+| mini `auto_varlen_sdpa` | 466.2 | 124.2 ms | 17.0 ms | 120.1 ms | 4.86 |
+| mini `auto_varlen_cuda` | 467.7 | 123.4 ms | 16.9 ms | 119.0 ms | 4.87 |
+| vLLM 0.8.5 V1 | 549.2 | 111.5 ms | 14.3 ms | 109.5 ms | 5.72 |
+
+表中各列取 12 轮的中位数。TTFT 从各请求的计划到达时刻开始计时。
+达标请求同时满足 TTFT ≤ 200 ms 和该请求的每个 token 间隔 ≤ 50 ms。
+自研路径在 8/12 个配对轮次改善后到请求 TTFT，配对降幅中位数为 2.8 ms。
+首批请求在长 Prefill 到达后仍有约 119 ms 的单次生成间隔。
+三组固定 burst 也收录在同一份归档中，用于复核等长路径。
+
+两条 packed 路径在所有四组、12 轮中均与 mini 原分发输出相同，
+并通过独立的 Hugging Face eager 变长 Prefill → Paged Decode 门禁。
+`8×256` 中 mini 与 vLLM 的首个分歧出现在第 6 条请求的第 2 个生成 token，
+12 轮一致。HF FP16 eager 的 top-2 是 mini 选出的 token 13 和 vLLM 选出的 token 83，
+对应 logits 10.4140625 与 10.3984375。归档保存首个分歧、验证状态及 token 哈希。
+
 ## 数字如何计算
 
 Static/Continuous 的吞吐是各 measured trial 吞吐的 median。

@@ -105,6 +105,15 @@ vLLM 使用 0.8.5 V1、CUDA Graph，关闭前缀缓存。调度上限为 8 个�
 [12 轮原始样本与顺序](docs/benchmarks/vllm-interleaved.json) ·
 [测量细节](docs/benchmarks/README.md#与-vllm-同机交错) · [复现命令](#复现-vllm-交错对照)
 
+### 错峰到达与变长 Prefill
+
+在同卡、相同 KV 池大小的错峰 trace 中，4 条短请求进入 Decode 后，再提交 3 条
+128/512/1024-token 请求。自研 packed GQA 将后到请求 P95 TTFT 从 **125.2 ms**
+降至 **123.4 ms**，输出吞吐从 **465.8** 升至 **467.7 tok/s**。
+同轮 vLLM 0.8.5 V1 为 **111.5 ms** 和 **549.2 tok/s**。
+[四后端结果与对拍](docs/benchmarks/README.md#错峰变长-prefill-对照) ·
+[原始样本](docs/benchmarks/vllm-varlen-mixed.json)
+
 ### Continuous vs Static Batching
 
 8-request burst；generation lengths 循环 `2,4,8,12`；
@@ -140,8 +149,8 @@ CUDA Event 单独保存 GPU timeline，二者没有混用。
 | Peak allocated memory | 1453.53 MiB | **1055.99 MiB** | **27.3%** |
 
 测量不含 tokenizer、输入构造和 Scheduler，不能当作端到端 TTFT。
-Segmented SDPA 是逐请求 attention 调用，共享 packed projection/MLP，
-尚未实现 fused varlen attention。
+该历史实验的 Segmented SDPA 按请求调用 attention，共享 packed projection/MLP。
+变长 fused 路径的对照见 [错峰到达与变长 Prefill](#错峰到达与变长-prefill)。
 
 [原始样本摘录](docs/benchmarks/prefill-4x512.json) ·
 [Backend 原理与形状扫描](docs/prefill_attention_backends.md)
@@ -231,13 +240,13 @@ ModelRunner 通过 `enable_decode_cuda_graph=True` 和 `enable_prefill_cuda_grap
 
 变长 FP16 prompt 的 Q/K/V 按 token 打包。一次因果 Attention 调用处理本层所有请求，
 直接使用模型的 GQA head 映射。Engine 可通过 `prefill_attention_backend` 选择
-`auto_varlen_sdpa`（PyTorch 2.6 packed Flash Attention）或
-`auto_varlen_cuda`（[Ai-infra CUDA 算子](https://github.com/Eran-ovo/Ai-infra/tree/main/torch_ext)）。
-两种配置在原先选择 segmented SDPA 的形状上走 packed 路径，等长和小批次沿用原有分发。
+`auto_varlen_sdpa`（PyTorch 2.6 packed Flash Attention）或 `auto_varlen_cuda`（自研 CUDA GQA）。
+两种配置在符合 segmented SDPA 分发条件的变长批次上启用 packed 路径。
 CUDA 路径需在当前 Python/PyTorch 环境构建带 `flashattention_varlen` 的 `ai_infra_ops`。
+[CUDA 扩展源码](https://github.com/Eran-ovo/CUDA-Operators/tree/main/torch_ext)
 
 ```bash
-OPS_DIR=/path/to/Ai-infra/torch_ext
+OPS_DIR=/path/to/CUDA-Operators/torch_ext
 (cd "$OPS_DIR" && MAX_JOBS=1 python setup.py build_ext --inplace)
 
 PYTHONPATH="$OPS_DIR${PYTHONPATH:+:$PYTHONPATH}" OMP_NUM_THREADS=2 \
@@ -256,7 +265,7 @@ TTFT 从计划到达时刻计入排队和提交延迟。基准同时记录首批
 
 ## 正确性与工程质量
 
-当前主分支的全量回归为 **296 passed**，真实 Qwen 的 Hugging Face 对拍也通过。
+当前主分支的全量回归为 **300 passed**，两条变长 Prefill 路径均通过真实 Qwen 的 Hugging Face 对拍。
 单元测试与真实模型 oracle 分开运行，普通回归可在本地独立执行。
 
 | 验证层次 | 覆盖重点 |
@@ -311,5 +320,5 @@ HTML 文档可在本地直接打开，或从仓库根目录运行 `python -m htt
 再研究 chunked prefill 和增量 KV admission。所有收益都须重新通过
 correctness 和正式 benchmark。
 
-**相关项目**：[CUDA Operators](https://github.com/Eran-ovo/Ai-infra) —
+**相关项目**：[CUDA Operators](https://github.com/Eran-ovo/CUDA-Operators) —
 Tensor Core GEMM、FlashAttention 与 Norm 算子的手写实现及 Nsight Compute 优化证据。
