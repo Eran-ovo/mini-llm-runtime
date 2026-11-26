@@ -72,6 +72,26 @@ RTX 3060 Laptop 6 GB、PyTorch 2.6.0+cu124、Qwen2.5-0.5B FP16。
 12 轮一致。HF FP16 eager 的 top-2 是 mini 选出的 token 13 和 vLLM 选出的 token 83，
 对应 logits 10.4140625 与 10.3984375。归档保存首个分歧、验证状态及 token 哈希。
 
+## 分块 Prefill 对照
+
+在同一 RTX 3060 Laptop 上复用上节的错峰请求和 Qwen2.5-0.5B FP16，
+交错测量未分块的 `auto_varlen_cuda`、384-token 和 512-token 分块预算以及
+vLLM 0.8.5 V1。两引擎每步最多 4096 token，KV 池均为 160 个 16-token blocks。
+各路径预热 3 轮，测量 12 轮，下表各列取中位数。
+
+| 后端 | 输出 tok/s | 后到请求 P95 TTFT | 首批 P95 ITL | 首批最大 ITL | 达标 req/s |
+|---|---:|---:|---:|---:|---:|
+| mini 整段 Prefill | 502.8 | 111.9 ms | 15.5 ms | 107.7 ms | 5.24 |
+| mini 分块 384 | 474.2 | 162.8 ms | 35.5 ms | 39.7 ms | 11.52 |
+| mini 分块 512 | 486.4 | 150.6 ms | 38.2 ms | 46.2 ms | 11.82 |
+| vLLM 0.8.5 V1 | 570.7 | 107.5 ms | 13.2 ms | 103.3 ms | 5.95 |
+
+512-token 分块把一次较长的生成停顿拆成多次较短的停顿，12/12 配对轮次均降低了
+首批最大 ITL。该预算以较高的后到请求 TTFT 和较低的原始输出吞吐换取更高的达标吞吐。
+达标请求须同时满足 TTFT ≤ 200 ms、每个 token 间隔 ≤ 50 ms。
+两条分块路径在固定 burst 和错峰 trace 的全部 12 轮中都与未分块路径生成相同的 token。
+[复现命令](../../README.md#分块-prefill) · [逐轮样本和输出哈希](vllm-chunked-prefill.json)
+
 ## 数字如何计算
 
 Static/Continuous 的吞吐是各 measured trial 吞吐的 median。

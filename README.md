@@ -64,7 +64,8 @@ flowchart TD
   position、物理 slot 和 block table 共用一次 H2D 传输。
   Warp 并行 Attention 在单分区时直接输出，多分区时额外合并 FP32 softmax 状态。
 - **Continuous Batching**：每 step 移除完成请求，并用剩余预算接纳 waiting 请求。
-  当前 Engine 同步执行 `Prefill → Decode → D2H → commit/release`。
+  Engine 同步执行 `Prefill → Decode → D2H → commit/release`。可选分块 Prefill
+  为混合 step 保留 Decode 机会，并在最后一个 prompt chunk 完成后返回首 token。
 - **Paged KV**：逻辑 token 与物理页解耦，完成时归还 blocks。
   Admission 保守预留请求整个生成生命周期所需 blocks，避免无抢占机制时中途 OOM。
 
@@ -113,6 +114,12 @@ vLLM 使用 0.8.5 V1、CUDA Graph，关闭前缀缓存。调度上限为 8 个�
 同轮 vLLM 0.8.5 V1 为 **111.5 ms** 和 **549.2 tok/s**。
 [四后端结果与对拍](docs/benchmarks/README.md#错峰变长-prefill-对照) ·
 [原始样本](docs/benchmarks/vllm-varlen-mixed.json)
+
+同一错峰 trace 启用 512-token 分块后，首批请求最大 token 间隔的 12 轮中位数由
+**107.7 ms** 降到 **46.2 ms**，达标吞吐为 **11.82 req/s**，同轮 vLLM 为
+**5.95 req/s**。达标条件为 TTFT ≤ 200 ms 且请求的每个 token 间隔 ≤ 50 ms。
+[分块预算、吞吐与延迟取舍](docs/benchmarks/README.md#分块-prefill-对照) ·
+[分块原始样本](docs/benchmarks/vllm-chunked-prefill.json)
 
 ### Continuous vs Static Batching
 
@@ -263,9 +270,29 @@ python scripts/benchmark_vllm.py --backend mini \
 TTFT 从计划到达时刻计入排队和提交延迟。基准同时记录首批请求的 ITL、
 后到请求的 TTFT，以及达到首 token 和逐 token 延迟阈值的请求吞吐。
 
+### 分块 Prefill
+
+通过 `RequestScheduler(prefill_chunk_tokens=512, ...)` 为已有 Decode 的 step 限制
+Prefill token 数。已接纳的 prompt 在后续 step 沿用其物理 KV 页和绝对 position，
+按 Q 与 KV 的各自边界计算因果 Attention。每步成功后提交 KV 和 prompt 进度。
+分块中途失败可回滚本轮写入，从已提交的 prefix 重试。
+
+```bash
+PYTHONPATH="$OPS_DIR${PYTHONPATH:+:$PYTHONPATH}" OMP_NUM_THREADS=2 \
+python scripts/benchmark_vllm.py --backend mini \
+  --interleave-with "$VLLM_PYTHON" --model "$MODEL_DIR" \
+  --mini-cuda-graph --mini-prefill-cuda-graph --gpu-memory-utilization 0.55 \
+  --mini-prefill-backend auto_varlen_cuda --compare-mini-prefill-chunk-tokens 384 \
+  --compare-mini-prefill-chunk-tokens 512 --case 4x32x32 --case 1x2048x32 \
+  --mixed --kv-blocks 160 --ttft-slo-ms 200 --itl-slo-ms 50 \
+  --warmup 3 --repeats 12 --output benchmarks/results/vllm_chunked.json
+```
+
+单独运行 mini 时，用 `--mini-prefill-chunk-tokens 512` 启用相同预算。
+
 ## 正确性与工程质量
 
-当前主分支的全量回归为 **300 passed**，两条变长 Prefill 路径均通过真实 Qwen 的 Hugging Face 对拍。
+当前主分支的全量回归为 **302 passed**，两条变长 Prefill 路径均通过真实 Qwen 的 Hugging Face 对拍。
 单元测试与真实模型 oracle 分开运行，普通回归可在本地独立执行。
 
 | 验证层次 | 覆盖重点 |
