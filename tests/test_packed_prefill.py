@@ -118,6 +118,44 @@ def test_batched_sdpa_rejects_ragged_lengths_before_mutation():
     assert manager.allocator.free_count == manager.allocator.total_blocks
 
 
+@pytest.mark.parametrize("backend", ["varlen_sdpa", "varlen_cuda"])
+def test_packed_varlen_prefill_matches_segmented_and_preserves_kv(backend):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("requires CUDA sm_80 or newer")
+    if backend == "varlen_cuda":
+        extension = pytest.importorskip("ai_infra_ops")
+        if not hasattr(extension, "FlashAttentionVarlenPlan"):
+            pytest.skip("requires ai_infra_ops with packed attention")
+
+    config = replace(tiny_config(), hidden_size=128, intermediate_size=128)
+    state = {
+        name: (tensor * 0.1).to(device="cuda", dtype=torch.float16)
+        for name, tensor in tiny_state_dict(config).items()
+    }
+    runner = QwenPrefillRunner(config, QwenWeights.from_state_dict(config, state))
+    tokens = torch.tensor([[1, 2, 3, 4, 2, 1]], device="cuda")
+    request_ids, lengths = ("A", "B", "C"), (3, 1, 2)
+    managers = [make_manager(runner), make_manager(runner)]
+    logits = []
+    for manager, attention in zip(managers, ("segmented_sdpa", backend), strict=True):
+        for request_id in request_ids:
+            manager.create_request(request_id)
+        logits.append(runner.prefill_batch(
+            tokens, cache=PagedBatchPrefillAdapter(manager, request_ids, lengths),
+            attention_backend=attention,
+        ).logits)
+
+    torch.testing.assert_close(logits[0], logits[1], atol=2e-3, rtol=2e-3)
+    for request_id in request_ids:
+        for layer in range(config.num_hidden_layers):
+            expected, actual = [
+                manager.storage.gather_layer(manager.get_request(request_id), layer)
+                for manager in managers
+            ]
+            for reference_tensor, result_tensor in zip(expected, actual, strict=True):
+                torch.testing.assert_close(reference_tensor, result_tensor, atol=2e-3, rtol=2e-3)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 def test_batched_prefill_graph_matches_eager_and_updates_physical_slots(monkeypatch):
     config = replace(tiny_config(), hidden_size=128, intermediate_size=128)

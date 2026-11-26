@@ -24,7 +24,30 @@ from .qwen_config import QwenConfig
 from .qwen_weights import AttentionWeights, DecoderLayerWeights, QwenWeights
 
 
-PACKED_PREFILL_ATTENTION_BACKENDS = frozenset({"masked", "segmented_sdpa", "batched_sdpa"})
+VARLEN_PREFILL_ATTENTION_BACKENDS = frozenset({"varlen_sdpa", "varlen_cuda"})
+PACKED_PREFILL_ATTENTION_BACKENDS = (
+    frozenset({"masked", "segmented_sdpa", "batched_sdpa"}) | VARLEN_PREFILL_ATTENTION_BACKENDS
+)
+PackedAttention = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+
+
+def _prepare_varlen_attention(
+    backend: str, offsets: tuple[int, ...], max_length: int, device: torch.device,
+) -> PackedAttention:
+    if backend == "varlen_cuda":
+        try:
+            from ai_infra_ops import FlashAttentionVarlenPlan, flashattention_varlen
+        except ImportError as error:
+            raise RuntimeError("varlen_cuda 需要安装带 flashattention_varlen 的 ai_infra_ops") from error
+        plan = FlashAttentionVarlenPlan(offsets, device)
+        return lambda q, k, v: flashattention_varlen(q, k, v, plan)
+
+    cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device=device)
+    # PyTorch 2.6 exposes packed Flash Attention through ATen. The public
+    # SDPA entry uses dense inputs or NestedTensor, which cannot express this GQA layout.
+    return lambda q, k, v: torch.ops.aten._flash_attention_forward(
+        q, k, v, cu_seqlens, cu_seqlens, max_length, max_length, 0.0, True, False,
+    )[0]
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
@@ -89,6 +112,7 @@ def _attention(
     packed_causal_mask: torch.Tensor | None = None,
     packed_segments: tuple[tuple[int, int], ...] | None = None,
     uniform_prompt_length: int | None = None,
+    varlen_attention: PackedAttention | None = None,
 ) -> torch.Tensor:
     query = _heads(
         F.linear(x, weights.q_proj.weight, weights.q_proj.bias),
@@ -160,6 +184,11 @@ def _attention(
     else:
         if cache is not None and not isinstance(cache, PagedBatchPrefillAdapter):
             key, value = cache.view_layer(layer_index, include_pending=True)
+
+        if varlen_attention is not None:
+            packed_qkv = (tensor[0].transpose(0, 1).contiguous() for tensor in (query, key, value))
+            merged = varlen_attention(*packed_qkv).reshape(1, query_length, config.hidden_size)
+            return F.linear(merged, weights.o_proj.weight, weights.o_proj.bias)
 
         if uniform_prompt_length is not None:
             requests = query_length // uniform_prompt_length
@@ -237,6 +266,7 @@ def _decoder_layer(
     packed_causal_mask: torch.Tensor | None = None,
     packed_segments: tuple[tuple[int, int], ...] | None = None,
     uniform_prompt_length: int | None = None,
+    varlen_attention: PackedAttention | None = None,
 ) -> torch.Tensor:
     use_cuda_ops = isinstance(cache, PagedBatchDecodeAdapter) or (
         isinstance(cache, PagedBatchPrefillAdapter) and x.is_cuda and cuda_toolkit_available()
@@ -258,6 +288,7 @@ def _decoder_layer(
         packed_causal_mask=packed_causal_mask,
         packed_segments=packed_segments,
         uniform_prompt_length=uniform_prompt_length,
+        varlen_attention=varlen_attention,
     )
     residual = x
     x = normalize(x, weights.post_attention_norm, config.rms_norm_eps)
@@ -404,7 +435,8 @@ class QwenPrefillRunner:
 
         `input_ids` 为 `[1,total_tokens]`，依照 `cache.request_ids` 顺序拼接。
         `masked` 使用 dense mask，`segmented_sdpa` 逐请求调用 SDPA，
-        `batched_sdpa` 将等长请求组合成一次 causal SDPA。
+        `batched_sdpa` 将等长请求组合成一次 causal SDPA，`varlen_sdpa`
+        和 `varlen_cuda` 将变长请求组合为一次支持 GQA 的调用。
         """
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError("Packed Prefill input_ids 必须是 [1,total_tokens]")
@@ -416,16 +448,18 @@ class QwenPrefillRunner:
         offsets = cache.offsets
         if input_ids.shape[1] != offsets[-1]:
             raise ValueError("packed token 数与各请求 lengths 之和不一致")
-        if max(cache.lengths) > self.config.max_position_embeddings:
+        max_length = max(cache.lengths)
+        if max_length > self.config.max_position_embeddings:
             raise ValueError("至少一个 prompt 超过 max_position_embeddings")
         if cache.active:
             raise ValueError("Prefill 开始前不能存在 active transaction")
         if attention_backend not in PACKED_PREFILL_ATTENTION_BACKENDS:
-            raise ValueError("attention_backend 必须是 masked、segmented_sdpa 或 batched_sdpa")
+            raise ValueError(f"attention_backend 必须是 {', '.join(sorted(PACKED_PREFILL_ATTENTION_BACKENDS))}")
 
         uniform_length = None
         causal_mask = None
         segments = None
+        varlen_attention = None
         if attention_backend == "batched_sdpa":
             uniform_length = cache.lengths[0]
             if any(length != uniform_length for length in cache.lengths):
@@ -447,8 +481,18 @@ class QwenPrefillRunner:
                 causal_mask = (segment_ids[:, None] == segment_ids[None, :]) & (
                     indices[:, None] >= indices[None, :]
                 )
-            else:
+            elif attention_backend == "segmented_sdpa":
                 segments = tuple(zip(offsets[:-1], offsets[1:], strict=True))
+            else:
+                if not (
+                    input_ids.is_cuda and self.weights.embedding.dtype == torch.float16
+                    and self.config.head_dim == 64 and torch.version.cuda is not None
+                    and torch.cuda.get_device_capability(input_ids.device)[0] >= 8
+                ):
+                    raise ValueError("varlen Prefill 需要 CUDA sm_80+、FP16 和 head_dim=64")
+                varlen_attention = _prepare_varlen_attention(
+                    attention_backend, offsets, max_length, input_ids.device
+                )
 
         cache.begin_prefill()
         try:
@@ -463,6 +507,7 @@ class QwenPrefillRunner:
                 logits = self._prefill_layers(
                     input_ids, positions, cache,
                     causal_mask=causal_mask, segments=segments, uniform_length=uniform_length,
+                    varlen_attention=varlen_attention,
                 )
             cache.commit_prefill()
         except Exception:
@@ -480,6 +525,7 @@ class QwenPrefillRunner:
         causal_mask: torch.Tensor | None = None,
         segments: tuple[tuple[int, int], ...] | None = None,
         uniform_length: int | None = None,
+        varlen_attention: PackedAttention | None = None,
     ) -> torch.Tensor:
         x = F.embedding(input_ids, self.weights.embedding)
         rotary = _rope_factors(positions, self._rope_inv_freq, x.dtype)
@@ -495,6 +541,7 @@ class QwenPrefillRunner:
                 packed_causal_mask=causal_mask,
                 packed_segments=segments,
                 uniform_prompt_length=uniform_length,
+                varlen_attention=varlen_attention,
             )
         # 只对每个 prompt 的末位执行 LM Head，避免分配 [T,vocab] logits。
         if uniform_length is not None:

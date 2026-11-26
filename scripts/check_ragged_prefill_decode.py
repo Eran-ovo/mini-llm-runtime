@@ -104,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--new-tokens", type=int, default=3)
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument(
-        "--prefill-backend", choices=("masked", "segmented_sdpa"),
+        "--prefill-backend", choices=("masked", "segmented_sdpa", "varlen_sdpa", "varlen_cuda"),
         default="masked",
     )
     parser.add_argument("--local-files-only", action="store_true")

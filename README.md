@@ -56,7 +56,8 @@ flowchart TD
 
 - **Prefill**：处理有效 prompt token，创建各层 KV，产出首 token。
   `auto` 对达到阈值的等长 prompt 使用 batched causal SDPA，对变长 prompt
-  按形状选择 dense block-diagonal mask 或 segmented SDPA。FP16 批量路径可用
+  按形状选择 dense block-diagonal mask 或 segmented SDPA。变长组可选择
+  packed Flash Attention 或自研 CUDA GQA。FP16 批量路径可用
   CUDA 融合 RMSNorm、SwiGLU 以及 vectorized KV 写入时的 RoPE。
 - **Decode**：逐请求 position 延续，只计算新 token；每层一次 batched Paged Attention，
   从 block table 读取历史 KV。FP16 batched Decode 合并 Q/K RoPE 与 KV 写入，
@@ -225,6 +226,33 @@ ModelRunner 通过 `enable_decode_cuda_graph=True` 和 `enable_prefill_cuda_grap
 分别启用 Decode 和 Prefill 图重放。Engine 的 Decode 图也包含 greedy argmax，
 随后按批次回传 token ID。Prefill 图目前适用于总计不超过 512 token 的
 等长、vectorized KV 写入批次。图按 KV 池和输入形状缓存，基准默认用两轮预热完成捕获。
+
+### 变长 Prefill 与错峰请求
+
+变长 FP16 prompt 的 Q/K/V 按 token 打包。一次因果 Attention 调用处理本层所有请求，
+直接使用模型的 GQA head 映射。Engine 可通过 `prefill_attention_backend` 选择
+`auto_varlen_sdpa`（PyTorch 2.6 packed Flash Attention）或
+`auto_varlen_cuda`（[Ai-infra CUDA 算子](https://github.com/Eran-ovo/Ai-infra/tree/main/torch_ext)）。
+两种配置在原先选择 segmented SDPA 的形状上走 packed 路径，等长和小批次沿用原有分发。
+CUDA 路径需在当前 Python/PyTorch 环境构建带 `flashattention_varlen` 的 `ai_infra_ops`。
+
+```bash
+OPS_DIR=/path/to/Ai-infra/torch_ext
+(cd "$OPS_DIR" && MAX_JOBS=1 python setup.py build_ext --inplace)
+
+PYTHONPATH="$OPS_DIR${PYTHONPATH:+:$PYTHONPATH}" OMP_NUM_THREADS=2 \
+python scripts/benchmark_vllm.py --backend mini \
+  --interleave-with "$VLLM_PYTHON" --model "$MODEL_DIR" \
+  --mini-cuda-graph --mini-prefill-cuda-graph --gpu-memory-utilization 0.40 \
+  --compare-mini-prefill-backend auto_varlen_sdpa \
+  --compare-mini-prefill-backend auto_varlen_cuda \
+  --mixed --kv-blocks 160 --ttft-slo-ms 200 --itl-slo-ms 50 \
+  --warmup 3 --repeats 12 --output benchmarks/results/vllm_varlen.json
+```
+
+`--mixed` 增加一组错峰 trace。4 条短请求先进入，60 ms 后加入 3 条变长请求。
+TTFT 从计划到达时刻计入排队和提交延迟。基准同时记录首批请求的 ITL、
+后到请求的 TTFT，以及达到首 token 和逐 token 延迟阈值的请求吞吐。
 
 ## 正确性与工程质量
 

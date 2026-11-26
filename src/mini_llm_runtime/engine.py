@@ -47,13 +47,23 @@ class EngineStepResult:
     prefill_attention_backend: str | None
 
 
+AUTO_PREFILL_ATTENTION_BACKENDS = {
+    "auto": "segmented_sdpa",
+    "auto_varlen_sdpa": "varlen_sdpa",
+    "auto_varlen_cuda": "varlen_cuda",
+}
+PREFILL_ATTENTION_BACKEND_CHOICES = tuple(sorted(
+    PACKED_PREFILL_ATTENTION_BACKENDS | AUTO_PREFILL_ATTENTION_BACKENDS.keys()
+))
+
+
 def select_prefill_attention_backend(
     configured: str, lengths: Sequence[int]
 ) -> str:
     """根据本轮 prompt 形状选择 Attention；显式 backend 永远优先。"""
-    if configured != "auto" and configured not in PACKED_PREFILL_ATTENTION_BACKENDS:
-        raise ValueError("prefill_attention_backend 必须是 auto、masked、segmented_sdpa 或 batched_sdpa")
-    if configured != "auto":
+    if configured not in PREFILL_ATTENTION_BACKEND_CHOICES:
+        raise ValueError(f"未知的 prefill_attention_backend: {configured}")
+    if configured not in AUTO_PREFILL_ATTENTION_BACKENDS:
         return configured
     if not lengths or any(length <= 0 for length in lengths):
         raise ValueError("auto Prefill 需要非空且为正数的 prompt lengths")
@@ -63,7 +73,7 @@ def select_prefill_attention_backend(
     if total_tokens >= 512 and (
         max(lengths) >= 128 or total_tokens >= 32 * len(lengths)
     ):
-        return "segmented_sdpa"
+        return AUTO_PREFILL_ATTENTION_BACKENDS[configured]
     return "masked"
 
 
@@ -88,13 +98,8 @@ class ContinuousBatchEngine:
     ) -> None:
         if runner.decode_attention_backend != "paged_cuda":
             raise ValueError("ContinuousBatchEngine 需要 paged_cuda ModelRunner")
-        if (
-            prefill_attention_backend != "auto"
-            and prefill_attention_backend not in PACKED_PREFILL_ATTENTION_BACKENDS
-        ):
-            raise ValueError(
-                "prefill_attention_backend 必须是 auto、masked、segmented_sdpa 或 batched_sdpa"
-            )
+        if prefill_attention_backend not in PREFILL_ATTENTION_BACKEND_CHOICES:
+            raise ValueError(f"未知的 prefill_attention_backend: {prefill_attention_backend}")
         if prefill_kv_write_backend not in {"scalar", "vectorized"}:
             raise ValueError("prefill_kv_write_backend 必须是 scalar 或 vectorized")
         storage = admission.manager.storage
