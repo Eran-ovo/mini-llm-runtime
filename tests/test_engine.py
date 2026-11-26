@@ -54,6 +54,7 @@ def make_engine(
     *,
     batching_policy: BatchingPolicy = BatchingPolicy.CONTINUOUS,
     max_mixed_prefill_tokens: int | None = None,
+    prefill_chunk_tokens: int | None = None,
     prefill_attention_backend: str = "auto",
     prefill_kv_write_backend: str = "vectorized",
 ) -> tuple[ContinuousBatchEngine, RequestScheduler, PagedBlockAdmissionController]:
@@ -75,6 +76,7 @@ def make_engine(
         max_running_requests=3,
         max_batch_tokens=5,
         max_mixed_prefill_tokens=max_mixed_prefill_tokens,
+        prefill_chunk_tokens=prefill_chunk_tokens,
         admission_callback=admission.try_admit,
         batching_policy=batching_policy,
     )
@@ -325,6 +327,58 @@ def test_engine_applies_mixed_prefill_budget_at_runtime_boundary(
     assert third is not None
     assert third.batch.decode_request_ids == ("A",)
     assert third.batch.prefill_request_ids == ("D",)
+
+
+def test_chunked_prefill_resumes_after_mixed_step_failure(monkeypatch):
+    engine, scheduler, admission = make_engine(monkeypatch, prefill_chunk_tokens=2)
+    engine.submit("A", (1, 2), max_new_tokens=4)
+    assert engine.step() is not None
+    prompt = (1, 3, 4, 0, 2)
+    engine.submit("B", prompt, max_new_tokens=2)
+    first = engine.step()
+    assert first.batch.prefill_request_ids == ("B",)
+    assert tuple(rid for rid, _ in first.update.emitted_tokens) == ("A",)
+    assert scheduler.get_request("B").prefill_tokens == 2
+    table = admission.manager.get_request("B")
+    assert table.token_count == 2
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected decode failure")
+
+    with monkeypatch.context() as ctx:
+        ctx.setattr(engine.runner, "decode_batch_greedy", fail)
+        with pytest.raises(RuntimeError, match="injected"):
+            engine.step()
+    assert table.token_count == 2
+    assert table.pending is None
+    assert scheduler.get_request("B").prefill_tokens == 2
+    assert "B" in scheduler.running_request_ids
+
+    second = engine.step()
+    assert second.batch.items[-1].prompt_start == 2
+    assert not second.batch.items[-1].emits_token
+    assert table.token_count == 4
+    final = engine.step()
+    assert final.prefill_attention_backend == "chunked_sdpa"
+    assert table.token_count == len(prompt)
+    logits = engine.runner.prefill(torch.tensor([prompt])).logits
+    assert scheduler.get_request("B").generated_token_ids == (int(logits[0, -1].argmax()),)
+    assert len(engine.metrics.snapshot("B").prefill_attempt_started_ns) == 1
+    assert engine.step() is not None
+    assert not scheduler.has_unfinished_requests
+    assert admission.manager.allocator.free_count == admission.manager.allocator.total_blocks
+
+
+def test_chunked_prefill_progresses_without_emitting_when_prompt_exceeds_budget(monkeypatch):
+    engine, scheduler, _ = make_engine(monkeypatch, prefill_chunk_tokens=2)
+    prompt = (1, 3, 4, 0, 1, 3, 2)
+    engine.submit("A", prompt, max_new_tokens=1)
+    assert engine.step().update.emitted_tokens == ()
+    assert scheduler.get_request("A").prefill_tokens == 5
+    final = engine.step()
+    logits = engine.runner.prefill(torch.tensor([prompt])).logits
+    assert final.update.emitted_tokens == (("A", int(logits[0, -1].argmax())),)
+    assert not scheduler.has_unfinished_requests
 
 
 def test_mixed_step_decode_failure_restores_scheduler_and_new_prefill(

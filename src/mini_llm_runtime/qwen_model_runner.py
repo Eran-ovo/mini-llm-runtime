@@ -50,6 +50,43 @@ def _prepare_varlen_attention(
     )[0]
 
 
+def _prepare_chunk_attention(cache: PagedBatchPrefillAdapter) -> PackedAttention:
+    if (
+        cache.device.type == "cuda" and cache.dtype == torch.float16
+        and cache.head_dim == 64 and torch.version.cuda is not None
+        and torch.cuda.get_device_capability(cache.device)[0] >= 8
+    ):
+        offsets_q, offsets_kv = torch.tensor(
+            (cache.offsets, cache.kv_offsets), dtype=torch.int32, device=cache.device
+        ).unbind()
+        max_q, max_kv = max(cache.lengths), max(cache.kv_lengths)
+        # Flash Attention aligns causal masks to the last query and key.
+        return lambda q, k, v: torch.ops.aten._flash_attention_forward(
+            q, k, v, offsets_q, offsets_kv, max_q, max_kv, 0.0, True, False,
+        )[0]
+
+    masks = tuple(
+        torch.arange(start, end, device=cache.device)[:, None]
+        >= torch.arange(end, device=cache.device)[None, :]
+        for start, end in zip(cache.prefix_lengths, cache.kv_lengths, strict=True)
+    )
+
+    def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return torch.cat([
+            F.scaled_dot_product_attention(
+                qs.transpose(0, 1).unsqueeze(0), ks.transpose(0, 1).unsqueeze(0),
+                vs.transpose(0, 1).unsqueeze(0), attn_mask=mask,
+                enable_gqa=q.size(1) != k.size(1),
+            )[0].transpose(0, 1)
+            for qs, ks, vs, mask in zip(
+                q.split(cache.lengths), k.split(cache.kv_lengths), v.split(cache.kv_lengths),
+                masks, strict=True,
+            )
+        ])
+
+    return attend
+
+
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
     dtype = x.dtype
     x_fp32 = x.float()
@@ -186,8 +223,12 @@ def _attention(
             key, value = cache.view_layer(layer_index, include_pending=True)
 
         if varlen_attention is not None:
-            packed_qkv = (tensor[0].transpose(0, 1).contiguous() for tensor in (query, key, value))
-            merged = varlen_attention(*packed_qkv).reshape(1, query_length, config.hidden_size)
+            packed_query = query[0].transpose(0, 1).contiguous()
+            if isinstance(cache, PagedBatchPrefillAdapter) and cache.has_prefix:
+                packed_kv = cache.gather_prefill(layer_index)
+            else:
+                packed_kv = tuple(tensor[0].transpose(0, 1).contiguous() for tensor in (key, value))
+            merged = varlen_attention(packed_query, *packed_kv).reshape(1, query_length, config.hidden_size)
             return F.linear(merged, weights.o_proj.weight, weights.o_proj.bias)
 
         if uniform_prompt_length is not None:
@@ -430,6 +471,8 @@ class QwenPrefillRunner:
         *,
         cache: PagedBatchPrefillAdapter,
         attention_backend: str = "masked",
+        emit_rows: tuple[int, ...] | None = None,
+        defer_commit: bool = False,
     ) -> QwenPrefillOutput:
         """一次模型前向处理多个无 padding prompt，返回每条请求末位 logits。
 
@@ -437,6 +480,8 @@ class QwenPrefillRunner:
         `masked` 使用 dense mask，`segmented_sdpa` 逐请求调用 SDPA，
         `batched_sdpa` 将等长请求组合成一次 causal SDPA，`varlen_sdpa`
         和 `varlen_cuda` 将变长请求组合为一次支持 GQA 的调用。
+        带 prefix 的批次以独立 Q/KV offsets 进行右下对齐因果 Attention。
+        分块调度可用 `emit_rows` 仅为完成 prompt 的请求计算 LM Head。
         """
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError("Packed Prefill input_ids 必须是 [1,total_tokens]")
@@ -449,18 +494,27 @@ class QwenPrefillRunner:
         if input_ids.shape[1] != offsets[-1]:
             raise ValueError("packed token 数与各请求 lengths 之和不一致")
         max_length = max(cache.lengths)
-        if max_length > self.config.max_position_embeddings:
+        if max(cache.kv_lengths) > self.config.max_position_embeddings:
             raise ValueError("至少一个 prompt 超过 max_position_embeddings")
         if cache.active:
             raise ValueError("Prefill 开始前不能存在 active transaction")
         if attention_backend not in PACKED_PREFILL_ATTENTION_BACKENDS:
             raise ValueError(f"attention_backend 必须是 {', '.join(sorted(PACKED_PREFILL_ATTENTION_BACKENDS))}")
+        if emit_rows is not None and any(not 0 <= row < cache.batch_size for row in emit_rows):
+            raise ValueError("emit_rows 包含越界请求索引")
 
         uniform_length = None
         causal_mask = None
         segments = None
         varlen_attention = None
-        if attention_backend == "batched_sdpa":
+        if cache.has_prefix:
+            positions = torch.tensor(
+                [[position for start, end in zip(cache.prefix_lengths, cache.kv_lengths, strict=True)
+                  for position in range(start, end)]],
+                dtype=torch.long, device=input_ids.device,
+            )
+            varlen_attention = _prepare_chunk_attention(cache)
+        elif attention_backend == "batched_sdpa":
             uniform_length = cache.lengths[0]
             if any(length != uniform_length for length in cache.lengths):
                 raise ValueError("batched_sdpa 要求等长 prompt")
@@ -499,6 +553,7 @@ class QwenPrefillRunner:
             if (
                 self.enable_prefill_cuda_graph
                 and uniform_length is not None
+                and emit_rows is None
                 and cache.write_backend == "vectorized"
                 and offsets[-1] <= 512
             ):
@@ -507,9 +562,10 @@ class QwenPrefillRunner:
                 logits = self._prefill_layers(
                     input_ids, positions, cache,
                     causal_mask=causal_mask, segments=segments, uniform_length=uniform_length,
-                    varlen_attention=varlen_attention,
+                    varlen_attention=varlen_attention, emit_rows=emit_rows,
                 )
-            cache.commit_prefill()
+            if not defer_commit:
+                cache.commit_prefill()
         except Exception:
             if cache.active:
                 cache.abort_prefill()
@@ -526,6 +582,7 @@ class QwenPrefillRunner:
         segments: tuple[tuple[int, int], ...] | None = None,
         uniform_length: int | None = None,
         varlen_attention: PackedAttention | None = None,
+        emit_rows: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         x = F.embedding(input_ids, self.weights.embedding)
         rotary = _rope_factors(positions, self._rope_inv_freq, x.dtype)
@@ -544,11 +601,14 @@ class QwenPrefillRunner:
                 varlen_attention=varlen_attention,
             )
         # 只对每个 prompt 的末位执行 LM Head，避免分配 [T,vocab] logits。
-        if uniform_length is not None:
+        if emit_rows == ():
+            return x.new_empty((0, 1, self.config.vocab_size))
+        if uniform_length is not None and emit_rows is None:
             last_hidden = x[:, uniform_length - 1 :: uniform_length]
         else:
             last_indices = torch.tensor(
-                [end - 1 for end in cache.offsets[1:]],
+                [cache.offsets[row + 1] - 1
+                 for row in (range(cache.batch_size) if emit_rows is None else emit_rows)],
                 dtype=torch.long,
                 device=input_ids.device,
             )

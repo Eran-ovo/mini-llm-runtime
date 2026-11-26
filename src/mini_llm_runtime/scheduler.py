@@ -42,6 +42,7 @@ class RequestState:
     arrival_index: int
     status: RequestStatus = RequestStatus.WAITING
     prefilled: bool = False
+    prefill_tokens: int = 0
     finish_reason: FinishReason | None = None
     _generated_token_ids: list[int] = field(default_factory=list, repr=False)
 
@@ -62,10 +63,12 @@ class ScheduledRequest:
     request_id: str
     kind: WorkKind
     input_token_ids: tuple[int, ...]
+    prompt_start: int = 0
+    emits_token: bool = True
 
     @property
     def token_cost(self) -> int:
-        # Prefill 消费整个 prompt；Decode 永远只消费一个新 token。
+        # Decode 恰好消费一个 token；Prefill 可以消费 prompt 的一部分。
         return len(self.input_token_ids)
 
 
@@ -83,6 +86,13 @@ class SchedulerBatch:
     def decode_request_ids(self) -> tuple[str, ...]:
         return tuple(item.request_id for item in self.items if item.kind is WorkKind.DECODE)
 
+    @property
+    def admitted_request_ids(self) -> tuple[str, ...]:
+        return tuple(
+            item.request_id for item in self.items
+            if item.kind is WorkKind.PREFILL and item.prompt_start == 0
+        )
+
 
 @dataclass(frozen=True)
 class SchedulerStepUpdate:
@@ -94,7 +104,7 @@ class SchedulerStepUpdate:
 
 
 class RequestScheduler:
-    """Decode-priority、whole-prefill、strict-FIFO 的同步调度器。
+    """Decode-priority、strict-FIFO 的同步调度器，支持可选的分块 Prefill。
 
     `schedule_step()` 与 `apply_step_results()` 必须交替调用。同一时刻只允许一个
     outstanding batch，模拟 GPU batch 尚未完成时请求不能被重复调度。Static 与
@@ -107,6 +117,7 @@ class RequestScheduler:
         max_running_requests: int,
         max_batch_tokens: int,
         max_mixed_prefill_tokens: int | None = None,
+        prefill_chunk_tokens: int | None = None,
         admission_callback: Callable[[RequestState], bool] | None = None,
         batching_policy: BatchingPolicy = BatchingPolicy.CONTINUOUS,
     ) -> None:
@@ -125,9 +136,16 @@ class RequestScheduler:
             or max_mixed_prefill_tokens <= 0
         ):
             raise ValueError("max_mixed_prefill_tokens 必须是正整数或 None")
+        if prefill_chunk_tokens is not None and (
+            isinstance(prefill_chunk_tokens, bool)
+            or not isinstance(prefill_chunk_tokens, int)
+            or prefill_chunk_tokens <= 0
+        ):
+            raise ValueError("prefill_chunk_tokens 必须是正整数或 None")
         self.max_running_requests = max_running_requests
         self.max_batch_tokens = max_batch_tokens
         self.max_mixed_prefill_tokens = max_mixed_prefill_tokens
+        self.prefill_chunk_tokens = prefill_chunk_tokens
         self.batching_policy = batching_policy
         self._admission_callback = admission_callback
         self._requests: dict[str, RequestState] = {}
@@ -179,7 +197,7 @@ class RequestScheduler:
         if request_id in self._requests:
             raise ValueError(f"request_id={request_id!r} 已经存在")
         prompt = self._validate_token_sequence(prompt_token_ids, "prompt_token_ids")
-        if len(prompt) > self.max_batch_tokens:
+        if len(prompt) > self.max_batch_tokens and self.prefill_chunk_tokens is None:
             raise ValueError(
                 f"prompt length={len(prompt)} 超过 max_batch_tokens="
                 f"{self.max_batch_tokens}；当前版本不支持 chunked prefill"
@@ -221,10 +239,14 @@ class RequestScheduler:
         # 必须在接纳新请求前记录：这个 step 是否以已有 Decode 请求开始。
         # 后面 self._running 会因 Prefill admission 增长，不能再用它判断 mixed step。
         running_at_step_start = bool(self._running)
+        continuations = []
         # Decode 优先：已有 running 请求每步都获得一个 token，降低 TPOT 抖动。
         for request_id in self._running:
             request = self._requests[request_id]
-            if not request.prefilled or not request._generated_token_ids:
+            if not request.prefilled:
+                continuations.append(request)
+                continue
+            if not request._generated_token_ids:
                 raise RuntimeError(f"running 请求 {request_id!r} 缺少 Prefill 结果")
             items.append(
                 ScheduledRequest(
@@ -234,7 +256,31 @@ class RequestScheduler:
                 )
             )
 
-        token_count = len(items)
+        prefill_budget = self.max_batch_tokens - len(items)
+        if items:
+            for limit in (self.max_mixed_prefill_tokens, self.prefill_chunk_tokens):
+                if limit is not None:
+                    prefill_budget = min(prefill_budget, limit)
+
+        def append_prefill(request: RequestState) -> None:
+            nonlocal prefill_budget
+            start = request.prefill_tokens
+            end = min(start + prefill_budget, len(request.prompt_token_ids))
+            items.append(ScheduledRequest(
+                request_id=request.request_id,
+                kind=WorkKind.PREFILL,
+                input_token_ids=request.prompt_token_ids[start:end],
+                prompt_start=start,
+                emits_token=end == len(request.prompt_token_ids),
+            ))
+            prefill_budget -= end - start
+
+        # 已经占用 KV 的长请求继续推进，再使用剩余预算接纳新请求。
+        for request in continuations:
+            if prefill_budget == 0:
+                break
+            append_prefill(request)
+
         available_slots = self.max_running_requests - len(self._running)
         # 必须在 admission 前固定本 step 的决定。Static cohort 初建时可一次接纳
         # 多个请求；已有 running 请求时则完全禁止 refill。
@@ -242,25 +288,15 @@ class RequestScheduler:
             self.batching_policy is BatchingPolicy.CONTINUOUS
             or not running_at_step_start
         )
-        # 这个计数只统计本 mixed step 新接纳的 prompt token，不包含 Decode token，
-        # 也不影响没有历史 running 请求的初始 cohort。
-        mixed_prefill_tokens = 0
         admitted_ids: list[str] = []
         try:
             for request_id in self._waiting if may_admit_prefill else ():
-                if available_slots == 0:
+                if available_slots == 0 or prefill_budget == 0:
                     break
                 request = self._requests[request_id]
                 prompt_cost = len(request.prompt_token_ids)
                 # strict FIFO：队首放不下时停止，不能越过它选择更短的后续请求。
-                if token_count + prompt_cost > self.max_batch_tokens:
-                    break
-                if (
-                    running_at_step_start
-                    and self.max_mixed_prefill_tokens is not None
-                    and mixed_prefill_tokens + prompt_cost > self.max_mixed_prefill_tokens
-                ):
-                    # 旧 cohort 排空后，该限制不再生效。
+                if prompt_cost > prefill_budget and self.prefill_chunk_tokens is None:
                     break
                 # False 表示暂时放不下且无副作用，True 表示已原子预留。
                 if (
@@ -269,16 +305,7 @@ class RequestScheduler:
                 ):
                     break
                 admitted_ids.append(request_id)
-                items.append(
-                    ScheduledRequest(
-                        request_id=request_id,
-                        kind=WorkKind.PREFILL,
-                        input_token_ids=request.prompt_token_ids,
-                    )
-                )
-                token_count += prompt_cost
-                if running_at_step_start:
-                    mixed_prefill_tokens += prompt_cost
+                append_prefill(request)
                 available_slots -= 1
         except Exception:
             if admitted_ids and rollback_admissions is not None:
@@ -291,7 +318,7 @@ class RequestScheduler:
         batch = SchedulerBatch(
             step_index=self._next_step_index,
             items=tuple(items),
-            token_count=token_count,
+            token_count=sum(item.token_cost for item in items),
         )
         for request_id in admitted_ids:
             self._waiting.popleft()
@@ -304,11 +331,11 @@ class RequestScheduler:
     def apply_step_results(
         self, generated_tokens: Mapping[str, int]
     ) -> SchedulerStepUpdate:
-        """原子校验并写回本 step 每个请求生成的一个 token。"""
+        """原子校验并写回生成 token 与 Prefill 进度。"""
         batch = self._outstanding
         if batch is None:
             raise RuntimeError("当前没有等待写回的 Scheduler batch")
-        expected_ids = tuple(item.request_id for item in batch.items)
+        expected_ids = tuple(item.request_id for item in batch.items if item.emits_token)
         actual_ids = tuple(generated_tokens)
         if set(actual_ids) != set(expected_ids) or len(actual_ids) != len(expected_ids):
             missing = sorted(set(expected_ids) - set(actual_ids))
@@ -323,9 +350,12 @@ class RequestScheduler:
         emitted: list[tuple[str, int]] = []
         for item in batch.items:
             request = self._requests[item.request_id]
-            token = validated[item.request_id]
             if item.kind is WorkKind.PREFILL:
-                request.prefilled = True
+                request.prefill_tokens += item.token_cost
+                request.prefilled = item.emits_token
+            if not item.emits_token:
+                continue
+            token = validated[item.request_id]
             request._generated_token_ids.append(token)
             emitted.append((item.request_id, token))
 
@@ -363,7 +393,7 @@ class RequestScheduler:
         if batch is None:
             raise RuntimeError("当前没有可以撤销的 Scheduler batch")
 
-        prefill_ids = batch.prefill_request_ids
+        prefill_ids = batch.admitted_request_ids
         prefill_set = set(prefill_ids)
         for request_id in prefill_ids:
             request = self._requests[request_id]

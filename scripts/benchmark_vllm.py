@@ -215,13 +215,14 @@ def load_mini(model: Path, args: argparse.Namespace):
         device=weights.embedding.device,
     )
 
-    def new_trial(prefill_backend):
+    def new_trial(prefill_backend, chunk_tokens):
         if manager.allocator.free_count != max_blocks:
             raise RuntimeError("previous mini trial left KV blocks allocated")
         admission = PagedBlockAdmissionController(manager)
         scheduler = RequestScheduler(
             max_running_requests=args.max_running_requests,
             max_batch_tokens=args.max_batch_tokens,
+            prefill_chunk_tokens=chunk_tokens,
             admission_callback=admission.try_admit,
         )
         engine = ContinuousBatchEngine(
@@ -278,7 +279,7 @@ def load_vllm(model: Path, args: argparse.Namespace):
     )
     next_trial = 0
 
-    def new_trial(_prefill_backend):
+    def new_trial(_prefill_backend, _chunk_tokens):
         nonlocal next_trial
         prefix = f"{next_trial}-"
         next_trial += 1
@@ -344,9 +345,10 @@ def serve_trials(model: Path, args: argparse.Namespace) -> None:
         **settings,
     }), flush=True)
     for line in sys.stdin:
-        index, prefill_backend = json.loads(line)
+        index, prefill_backend, chunk_tokens = json.loads(line)
         with redirect_stdout(sys.stderr):
-            sample = measure(*new_trial(prefill_backend), args.workloads[index], workloads[index], args)
+            trial = new_trial(prefill_backend, chunk_tokens)
+            sample = measure(*trial, args.workloads[index], workloads[index], args)
         print(json.dumps(sample), flush=True)
 
 
@@ -387,8 +389,8 @@ def trial_worker(interpreter: str, backend: str, args: argparse.Namespace):
             raise RuntimeError(f"{backend} benchmark worker terminated")
         return json.loads(line)
 
-    def run(index: int, prefill_backend: str = "auto"):
-        process.stdin.write(json.dumps((index, prefill_backend)) + "\n")
+    def run(index: int, prefill_backend: str = "auto", chunk_tokens: int | None = None):
+        process.stdin.write(json.dumps((index, prefill_backend, chunk_tokens)) + "\n")
         process.stdin.flush()
         return receive()
 
@@ -409,12 +411,21 @@ def run_interleaved(model: Path, args: argparse.Namespace) -> None:
     metadata = benchmark_metadata(model, args)
     with ExitStack() as stack:
         run_mini, mini_settings = stack.enter_context(trial_worker(sys.executable, "mini", args))
-        runs = {"mini": partial(run_mini, prefill_backend=args.mini_prefill_backend)}
-        environments = {"mini": {**mini_settings, "prefill_backend": args.mini_prefill_backend}}
+        base_chunk = args.mini_prefill_chunk_tokens
+        runs = {"mini": partial(run_mini, prefill_backend=args.mini_prefill_backend, chunk_tokens=base_chunk)}
+        environments = {"mini": {
+            **mini_settings, "prefill_backend": args.mini_prefill_backend, "prefill_chunk_tokens": base_chunk
+        }}
         for backend in args.compare_mini_prefill_backend:
             name = f"mini:{backend}"
-            runs[name] = partial(run_mini, prefill_backend=backend)
-            environments[name] = {**mini_settings, "prefill_backend": backend}
+            runs[name] = partial(run_mini, prefill_backend=backend, chunk_tokens=base_chunk)
+            environments[name] = {**mini_settings, "prefill_backend": backend, "prefill_chunk_tokens": base_chunk}
+        for chunk_tokens in args.compare_mini_prefill_chunk_tokens:
+            name = f"mini:chunk-{chunk_tokens}"
+            runs[name] = partial(run_mini, prefill_backend=args.mini_prefill_backend, chunk_tokens=chunk_tokens)
+            environments[name] = {
+                **mini_settings, "prefill_backend": args.mini_prefill_backend, "prefill_chunk_tokens": chunk_tokens
+            }
         if args.interleave_with is not None:
             runs["vllm"], environments["vllm"] = stack.enter_context(
                 trial_worker(str(args.interleave_with.absolute()), "vllm", args)
@@ -473,6 +484,9 @@ def main() -> None:
     parser.add_argument("--mini-prefill-backend", default="auto")
     parser.add_argument("--compare-mini-prefill-backend", action="append", default=[],
                         help="Interleave another mini Prefill backend using the same ModelRunner")
+    parser.add_argument("--mini-prefill-chunk-tokens", type=int, help="Limit Prefill tokens in each mixed step")
+    parser.add_argument("--compare-mini-prefill-chunk-tokens", type=int, action="append", default=[],
+                        help="Interleave another mini Prefill chunk budget using the same ModelRunner")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.75)
     parser.add_argument("--kv-blocks", type=int,
                         help="Force both backends to use this many 16-token KV blocks")
@@ -511,12 +525,15 @@ def main() -> None:
             backend not in PREFILL_ATTENTION_BACKEND_CHOICES for backend in selected
         ):
             parser.error(f"choose distinct mini Prefill backends from {PREFILL_ATTENTION_BACKEND_CHOICES}")
+    chunks = [args.mini_prefill_chunk_tokens, *args.compare_mini_prefill_chunk_tokens]
+    if len(set(chunks)) != len(chunks) or any(size is not None and size <= 0 for size in chunks):
+        parser.error("mini Prefill chunk budgets must be positive and distinct")
 
     model = args.model.resolve()
     if args.worker:
         serve_trials(model, args)
         return
-    if args.interleave_with is not None or args.compare_mini_prefill_backend:
+    if args.interleave_with is not None or args.compare_mini_prefill_backend or args.compare_mini_prefill_chunk_tokens:
         if args.backend != "mini":
             parser.error("interleaved comparisons require --backend mini")
         if args.interleave_with is not None and not args.interleave_with.is_file():
@@ -531,7 +548,8 @@ def main() -> None:
         args.workloads, make_workloads(model, args), strict=True
     ):
         def run():
-            return measure(*new_trial(args.mini_prefill_backend), workload, prompts, args)
+            trial = new_trial(args.mini_prefill_backend, args.mini_prefill_chunk_tokens)
+            return measure(*trial, workload, prompts, args)
 
         for _ in range(args.warmup):
             run()
@@ -554,6 +572,7 @@ def main() -> None:
         "cuda": torch.version.cuda,
         "dtype": "float16",
         "prefill_backend": args.mini_prefill_backend if args.backend == "mini" else None,
+        "prefill_chunk_tokens": args.mini_prefill_chunk_tokens if args.backend == "mini" else None,
         **settings,
         "cases": cases,
     }

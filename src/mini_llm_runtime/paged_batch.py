@@ -280,7 +280,7 @@ class PagedBatchDecodeAdapter:
 
 
 class PagedBatchPrefillAdapter:
-    """把多个空请求的 packed Prefill 写入各自的物理 KV block。
+    """把 packed Prefill 写入各自的物理 KV block，支持追加到已提交的 prefix。
 
     `lengths[i]` 对应 `request_ids[i]`；所有层成功后才一起提交长度。
     默认使用批量物理 slot 索引写入；scalar 路径保留为独立正确性基线。
@@ -293,6 +293,7 @@ class PagedBatchPrefillAdapter:
         lengths: tuple[int, ...],
         *,
         write_backend: str = "vectorized",
+        prefix_lengths: tuple[int, ...] | None = None,
     ) -> None:
         if not request_ids or len(request_ids) != len(lengths):
             raise ValueError("Prefill request_ids 与 lengths 必须非空且等长")
@@ -302,15 +303,24 @@ class PagedBatchPrefillAdapter:
             raise ValueError("Prefill lengths 必须全部 > 0")
         if write_backend not in {"scalar", "vectorized"}:
             raise ValueError("write_backend 必须是 scalar 或 vectorized")
+        if prefix_lengths is None:
+            prefix_lengths = (0,) * len(lengths)
+        if len(prefix_lengths) != len(lengths) or any(prefix < 0 for prefix in prefix_lengths):
+            raise ValueError("Prefill prefix_lengths 必须与 lengths 对齐且非负")
         self.manager = manager
         self.request_ids = tuple(request_ids)
         self.lengths = tuple(lengths)
         self._offsets = (0, *accumulate(self.lengths))
+        self.prefix_lengths = prefix_lengths
+        self.has_prefix = any(prefix_lengths)
+        self.kv_lengths = tuple(p + n for p, n in zip(prefix_lengths, lengths, strict=True))
+        self.kv_offsets = (0, *accumulate(self.kv_lengths))
         self.write_backend = write_backend
         self._tables = tuple(manager.get_request(rid) for rid in request_ids)
         self._active = False
         self._written_layers = [False] * self.num_layers
         self._physical_indices: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._full_indices: tuple[torch.Tensor, torch.Tensor] | None = None
 
     @property
     def batch_size(self) -> int:
@@ -348,40 +358,55 @@ class PagedBatchPrefillAdapter:
     def begin_prefill(self) -> None:
         if self._active:
             raise RuntimeError("Prefill batch 已经有 active transaction")
-        for table in self._tables:
-            if table.pending is not None or table.token_count != 0:
-                raise ValueError(f"请求 {table.request_id!r} 的 Cache 必须为空")
+        for table, prefix in zip(self._tables, self.prefix_lengths, strict=True):
+            if table.pending is not None or table.token_count != prefix:
+                raise ValueError(f"请求 {table.request_id!r} 的 Cache 必须为空或与已提交 prefix 一致")
         begun: list[RequestBlockTable] = []
         try:
             for table, length in zip(self._tables, self.lengths, strict=True):
                 table.begin_append(length)
                 begun.append(table)
             if self.write_backend == "vectorized":
-                # Prefill 从 position 0 开始。按页展开一次，所有层复用 slot 索引。
-                block_size = self.manager.block_size
-                used_blocks: set[int] = set()
-                blocks: list[int] = []
-                offsets: list[int] = []
-                for table, length in zip(self._tables, self.lengths, strict=True):
-                    block_count = (length + block_size - 1) // block_size
-                    for block_id in table.block_ids[:block_count]:
-                        if block_id in used_blocks:
-                            raise RuntimeError("packed Prefill 存在重复物理 slot")
-                        used_blocks.add(block_id)
-                        count = min(length, block_size)
-                        blocks.extend([block_id] * count)
-                        offsets.extend(range(count))
-                        length -= count
-                self._physical_indices = torch.tensor(
-                    (blocks, offsets), dtype=torch.long, device=self.device
-                ).unbind()
+                self._physical_indices = self._build_slots(self.prefix_lengths)
+            if self.has_prefix:
+                self._full_indices = self._build_slots((0,) * self.batch_size)
         except Exception:
             for table in reversed(begun):
                 table.abort_append()
             self._physical_indices = None
+            self._full_indices = None
             raise
         self._active = True
         self._written_layers = [False] * self.num_layers
+
+    def _build_slots(self, starts: tuple[int, ...]) -> tuple[torch.Tensor, torch.Tensor]:
+        block_size = self.manager.block_size
+        used_blocks: set[int] = set()
+        blocks: list[int] = []
+        offsets: list[int] = []
+        for table, start, end in zip(self._tables, starts, self.kv_lengths, strict=True):
+            block_ids = table.block_ids
+            for page in range(start // block_size, (end + block_size - 1) // block_size):
+                block_id = block_ids[page]
+                if block_id in used_blocks:
+                    raise RuntimeError("packed Prefill 存在重复物理 slot")
+                used_blocks.add(block_id)
+                page_start = page * block_size
+                tile = range(max(start - page_start, 0), min(end - page_start, block_size))
+                blocks.extend([block_id] * len(tile))
+                offsets.extend(tile)
+        return torch.tensor((blocks, offsets), dtype=torch.long, device=self.device).unbind()
+
+    def gather_prefill(self, layer_index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """在本层写入后打包该层的 prefix 与当前 chunk。"""
+        if self._full_indices is None or not self._written_layers[layer_index]:
+            raise RuntimeError("Prefill gather 需要已写入的 chunk")
+        blocks, offsets = self._full_indices
+        storage = self.manager.storage
+        return (
+            storage.key[layer_index, blocks, :, offsets, :],
+            storage.value[layer_index, blocks, :, offsets, :],
+        )
 
     def write_layer(
         self, layer_index: int, key: torch.Tensor, value: torch.Tensor
@@ -478,6 +503,7 @@ class PagedBatchPrefillAdapter:
             table.commit_append()
         self._active = False
         self._physical_indices = None
+        self._full_indices = None
 
     def abort_prefill(self) -> None:
         if not self._active:
@@ -487,3 +513,4 @@ class PagedBatchPrefillAdapter:
         self._active = False
         self._written_layers = [False] * self.num_layers
         self._physical_indices = None
+        self._full_indices = None

@@ -152,10 +152,18 @@ class ContinuousBatchEngine:
             prompt_token_ids,
             max_new_tokens=max_new_tokens,
             eos_token_ids=eos_token_ids,
-            validate_request=self.admission.validate_request_capacity,
+            validate_request=self._validate_request,
         )
         self.metrics.register_request(request_id, arrival_ns)
         return request
+
+    def _validate_request(self, request: RequestState) -> None:
+        if (
+            self.scheduler.prefill_chunk_tokens is not None
+            and request.max_cache_tokens > self.runner.config.max_position_embeddings
+        ):
+            raise ValueError("请求超过模型 max_position_embeddings")
+        self.admission.validate_request_capacity(request)
 
     @torch.inference_mode()
     def step(self) -> EngineStepResult | None:
@@ -186,9 +194,10 @@ class ContinuousBatchEngine:
 
         selected_ids: list[str] = []
         selected_tokens: list[torch.Tensor] = []
-        prefill_ids = batch.prefill_request_ids
         selected_prefill_backend: str | None = None
         decode_cache = None
+        prefill_cache = None
+        device = self.runner.weights.embedding.device
         try:
             self.metrics.require_registered(
                 tuple(item.request_id for item in batch.items)
@@ -206,10 +215,8 @@ class ContinuousBatchEngine:
                     f"model.prefill_batch:requests={len(prefill_items)}:"
                     f"tokens={sum(prefill_lengths)}:backend={selected_prefill_backend}",
                 ):
-                    for item in prefill_items:
-                        self.metrics.record_prefill_started(
-                            item.request_id, self._clock_ns()
-                        )
+                    for request_id in batch.admitted_request_ids:
+                        self.metrics.record_prefill_started(request_id, self._clock_ns())
                     # Scheduler 顺序同时决定 packed token 区间和结果行归属。
                     input_ids = torch.tensor(
                         (tuple(
@@ -218,21 +225,32 @@ class ContinuousBatchEngine:
                             for token in item.input_token_ids
                         ),),
                         dtype=torch.long,
-                        device=self.runner.weights.embedding.device,
+                        device=device,
                     )
-                    adapter = PagedBatchPrefillAdapter(
+                    prefill_cache = PagedBatchPrefillAdapter(
                         self.manager,
-                        prefill_ids,
+                        batch.prefill_request_ids,
                         prefill_lengths,
                         write_backend=self.prefill_kv_write_backend,
+                        prefix_lengths=tuple(item.prompt_start for item in prefill_items),
                     )
+                    emit_rows = tuple(i for i, item in enumerate(prefill_items) if item.emits_token)
+                    options = {}
+                    if self.scheduler.prefill_chunk_tokens is not None:
+                        options["defer_commit"] = True
+                        if len(emit_rows) != len(prefill_items):
+                            options["emit_rows"] = emit_rows
                     output = self.runner.prefill_batch(
                         input_ids,
-                        cache=adapter,
+                        cache=prefill_cache,
                         attention_backend=selected_prefill_backend,
+                        **options,
                     )
-                    selected_ids.extend(prefill_ids)
-                    selected_tokens.append(output.logits[:, -1].argmax(dim=-1))
+                    if prefill_cache.has_prefix:
+                        selected_prefill_backend = "chunked_sdpa"
+                    if emit_rows:
+                        selected_ids.extend(prefill_items[i].request_id for i in emit_rows)
+                        selected_tokens.append(output.logits[:, -1].argmax(dim=-1))
 
             decode_items = tuple(
                 item
@@ -248,7 +266,7 @@ class ContinuousBatchEngine:
                     token_ids = torch.tensor(
                         tuple(item.input_token_ids for item in decode_items),
                         dtype=torch.long,
-                        device=self.runner.weights.embedding.device,
+                        device=device,
                     )
                     decode_cache = PagedBatchDecodeAdapter(self.manager, decode_ids)
                     decode_tokens = self.runner.decode_batch_greedy(
@@ -261,21 +279,29 @@ class ContinuousBatchEngine:
 
             # 两阶段共享一次 D2H，Scheduler 写回时按原始 batch 的顺序发出事件。
             with _nvtx_range(self.enable_nvtx, "token.d2h_sync"):
-                tokens = (
-                    selected_tokens[0] if len(selected_tokens) == 1
-                    else torch.cat(selected_tokens)
-                )
-                cpu_tokens = tokens.cpu().tolist()
+                if selected_tokens:
+                    tokens = (
+                        selected_tokens[0] if len(selected_tokens) == 1
+                        else torch.cat(selected_tokens)
+                    )
+                    cpu_tokens = tokens.cpu().tolist()
+                else:
+                    if device.type == "cuda":
+                        torch.cuda.current_stream(device).synchronize()
+                    cpu_tokens = []
             tokens_ready_ns = self._clock_ns()
             generated = dict(zip(selected_ids, cpu_tokens, strict=True))
             if decode_cache is not None:
                 decode_cache.commit_decode()
+            if prefill_cache is not None and prefill_cache.active:
+                prefill_cache.commit_prefill()
         except Exception:
-            # Prefill 请求均为本 step 新接纳，释放后可从空 Cache 完整重试。
             with _nvtx_range(self.enable_nvtx, "engine.rollback"):
                 if decode_cache is not None and decode_cache.active:
                     decode_cache.abort_decode()
-                self.admission.release_admitted(prefill_ids)
+                if prefill_cache is not None and prefill_cache.active:
+                    prefill_cache.abort_prefill()
+                self.admission.release_admitted(batch.admitted_request_ids)
                 self.scheduler.abort_step()
             raise
 
