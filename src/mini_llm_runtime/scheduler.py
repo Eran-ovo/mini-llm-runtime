@@ -224,11 +224,15 @@ class RequestScheduler:
         return request
 
     def schedule_step(
-        self, *, rollback_admissions: Callable[[tuple[str, ...]], object] | None = None
+        self,
+        *,
+        rollback_admissions: Callable[[tuple[str, ...]], object] | None = None,
+        allow_tokens: Callable[[RequestState, int], bool] | None = None,
     ) -> SchedulerBatch | None:
         """先安排 Decode，再以剩余 budget 按 FIFO 准入 Prefill。
 
-        外部准入回调预留的资源由 `rollback_admissions` 在同轮后续准入失败时回收。
+        `allow_tokens` 可以用本轮共享的物理页预算拒绝单项工作。
+        外部准入回调分配的资源由 `rollback_admissions` 在同轮后续准入失败时回收。
         """
         if self._outstanding is not None:
             raise RuntimeError("上一个 Scheduler batch 尚未写回结果")
@@ -240,7 +244,7 @@ class RequestScheduler:
         # 后面 self._running 会因 Prefill admission 增长，不能再用它判断 mixed step。
         running_at_step_start = bool(self._running)
         continuations = []
-        # Decode 优先：已有 running 请求每步都获得一个 token，降低 TPOT 抖动。
+        # Decode 优先：先为已完成 Prefill 的请求尝试安排一个 token。
         for request_id in self._running:
             request = self._requests[request_id]
             if not request.prefilled:
@@ -248,6 +252,8 @@ class RequestScheduler:
                 continue
             if not request._generated_token_ids:
                 raise RuntimeError(f"running 请求 {request_id!r} 缺少 Prefill 结果")
+            if allow_tokens is not None and not allow_tokens(request, 1):
+                continue
             items.append(
                 ScheduledRequest(
                     request_id=request_id,
@@ -262,10 +268,18 @@ class RequestScheduler:
                 if limit is not None:
                     prefill_budget = min(prefill_budget, limit)
 
-        def append_prefill(request: RequestState) -> None:
+        admitted_ids: list[str] = []
+
+        def append_prefill(request: RequestState, *, new: bool = False) -> bool:
             nonlocal prefill_budget
             start = request.prefill_tokens
             end = min(start + prefill_budget, len(request.prompt_token_ids))
+            if allow_tokens is not None and not allow_tokens(request, end - start):
+                return False
+            if new:
+                if self._admission_callback is not None and not self._admission_callback(request):
+                    return False
+                admitted_ids.append(request.request_id)
             items.append(ScheduledRequest(
                 request_id=request.request_id,
                 kind=WorkKind.PREFILL,
@@ -274,6 +288,7 @@ class RequestScheduler:
                 emits_token=end == len(request.prompt_token_ids),
             ))
             prefill_budget -= end - start
+            return True
 
         # 已经占用 KV 的长请求继续推进，再使用剩余预算接纳新请求。
         for request in continuations:
@@ -288,7 +303,6 @@ class RequestScheduler:
             self.batching_policy is BatchingPolicy.CONTINUOUS
             or not running_at_step_start
         )
-        admitted_ids: list[str] = []
         try:
             for request_id in self._waiting if may_admit_prefill else ():
                 if available_slots == 0 or prefill_budget == 0:
@@ -298,14 +312,9 @@ class RequestScheduler:
                 # strict FIFO：队首放不下时停止，不能越过它选择更短的后续请求。
                 if prompt_cost > prefill_budget and self.prefill_chunk_tokens is None:
                     break
-                # False 表示暂时放不下且无副作用，True 表示已原子预留。
-                if (
-                    self._admission_callback is not None
-                    and not self._admission_callback(request)
-                ):
+                # False 表示本轮暂时放不下，已准入的请求由外层记录并回滚。
+                if not append_prefill(request, new=True):
                     break
-                admitted_ids.append(request_id)
-                append_prefill(request)
                 available_slots -= 1
         except Exception:
             if admitted_ids and rollback_admissions is not None:

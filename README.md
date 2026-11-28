@@ -67,7 +67,7 @@ flowchart TD
   Engine 同步执行 `Prefill → Decode → D2H → commit/release`。可选分块 Prefill
   为混合 step 保留 Decode 机会，并在最后一个 prompt chunk 完成后返回首 token。
 - **Paged KV**：逻辑 token 与物理页解耦，完成时归还 blocks。
-  Admission 保守预留请求整个生成生命周期所需 blocks，避免无抢占机制时中途 OOM。
+  默认按请求生命周期预留，另可按当前 Prefill 或 Decode 所需的页逐步分配。
 
 KV 地址映射：
 
@@ -290,9 +290,31 @@ python scripts/benchmark_vllm.py --backend mini \
 
 单独运行 mini 时，用 `--mini-prefill-chunk-tokens 512` 启用相同预算。
 
+### 按需分配 KV 页
+
+构建 Engine 时使用 `PagedBlockAdmissionController(manager, allocation_policy="on_demand")`，
+并将 `admission.try_admit` 传给 Scheduler。准入建立空 block table，首次 Prefill、
+chunk 续跑或跨页 Decode 在 `begin_append()` 时从 GPU 页池按需取页。
+同页内的后续 token 复用已有 slot。
+
+Scheduler 按本轮候选工作累计拟用页，在每次新增页前模拟一个可完成并释放页的
+请求顺序。无法保留可完成顺序的候选暂缓，保留现有 KV，后续 step 继续尝试。
+该检查按请求申请的最大生成长度估算。一步失败时，append 事务归还此次新增页，
+已提交的 prefix 保持可读。GPU 物理页池在初始化时固定分配。
+
+用同一个 4 页池复现小容量下的两请求行为。将下方策略改为 `lifetime` 可做对照。
+
+```bash
+python scripts/benchmark_vllm.py --backend mini --model "$MODEL_DIR" \
+  --case 2x16x33 --kv-blocks 4 --mini-kv-allocation-policy on_demand \
+  --output benchmarks/results/kv_on_demand.json
+```
+
+CPU 测试覆盖两请求争抢跨页空间、分块续跑、混合 step 写入失败及重试。
+
 ## 正确性与工程质量
 
-当前主分支的全量回归为 **302 passed**，两条变长 Prefill 路径均通过真实 Qwen 的 Hugging Face 对拍。
+当前主分支的全量回归为 **305 passed**，两条变长 Prefill 路径均通过真实 Qwen 的 Hugging Face 对拍。
 单元测试与真实模型 oracle 分开运行，普通回归可在本地独立执行。
 
 | 验证层次 | 覆盖重点 |

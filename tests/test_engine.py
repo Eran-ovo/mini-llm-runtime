@@ -55,6 +55,8 @@ def make_engine(
     batching_policy: BatchingPolicy = BatchingPolicy.CONTINUOUS,
     max_mixed_prefill_tokens: int | None = None,
     prefill_chunk_tokens: int | None = None,
+    allocation_policy: str = "lifetime",
+    total_blocks: int = 12,
     prefill_attention_backend: str = "auto",
     prefill_kv_write_backend: str = "vectorized",
 ) -> tuple[ContinuousBatchEngine, RequestScheduler, PagedBlockAdmissionController]:
@@ -63,7 +65,7 @@ def make_engine(
         base.config, weights, decode_attention_backend="paged_cuda"
     )
     manager = PagedKVCacheManager(
-        total_blocks=12,
+        total_blocks=total_blocks,
         block_size=2,
         num_layers=runner.config.num_hidden_layers,
         num_kv_heads=runner.config.num_key_value_heads,
@@ -71,7 +73,7 @@ def make_engine(
         dtype=runner.weights.embedding.dtype,
         device=runner.weights.embedding.device,
     )
-    admission = PagedBlockAdmissionController(manager)
+    admission = PagedBlockAdmissionController(manager, allocation_policy=allocation_policy)
     scheduler = RequestScheduler(
         max_running_requests=3,
         max_batch_tokens=5,
@@ -329,8 +331,11 @@ def test_engine_applies_mixed_prefill_budget_at_runtime_boundary(
     assert third.batch.prefill_request_ids == ("D",)
 
 
-def test_chunked_prefill_resumes_after_mixed_step_failure(monkeypatch):
-    engine, scheduler, admission = make_engine(monkeypatch, prefill_chunk_tokens=2)
+@pytest.mark.parametrize("allocation_policy", ["lifetime", "on_demand"])
+def test_chunked_prefill_resumes_after_mixed_step_failure(monkeypatch, allocation_policy):
+    engine, scheduler, admission = make_engine(
+        monkeypatch, prefill_chunk_tokens=2, allocation_policy=allocation_policy
+    )
     engine.submit("A", (1, 2), max_new_tokens=4)
     assert engine.step() is not None
     prompt = (1, 3, 4, 0, 2)
@@ -379,6 +384,66 @@ def test_chunked_prefill_progresses_without_emitting_when_prompt_exceeds_budget(
     logits = engine.runner.prefill(torch.tensor([prompt])).logits
     assert final.update.emitted_tokens == (("A", int(logits[0, -1].argmax())),)
     assert not scheduler.has_unfinished_requests
+
+
+def test_on_demand_admits_both_and_defers_unsafe_cross_page_decode(monkeypatch):
+    def run(policy):
+        engine, scheduler, admission = make_engine(monkeypatch, allocation_policy=policy, total_blocks=4)
+        engine.submit("A", (1, 2), max_new_tokens=5)
+        engine.submit("B", (3, 4), max_new_tokens=5)
+        initial = engine.step()
+        if policy == "on_demand":
+            assert initial.batch.prefill_request_ids == ("A", "B")
+            assert [admission.manager.get_request(rid).block_count for rid in ("A", "B")] == [1, 1]
+            second = engine.step()
+            # Another page physically exists, but granting it would leave both requests unable to finish.
+            assert second.batch.decode_request_ids == ("A",)
+            assert admission.manager.allocator.free_count == 1
+            assert admission.manager.get_request("B").token_count == 2
+        else:
+            assert initial.batch.prefill_request_ids == ("A",)
+            assert scheduler.waiting_request_ids == ("B",)
+        for _ in range(15):
+            if not scheduler.has_unfinished_requests:
+                break
+            assert engine.step() is not None
+        assert not scheduler.has_unfinished_requests
+        assert admission.manager.allocator.free_count == 4
+        assert admission.reservations == ()
+        return [scheduler.get_request(rid).generated_token_ids for rid in ("A", "B")]
+
+    assert run("on_demand") == run("lifetime")
+
+
+def test_on_demand_mixed_failure_returns_new_pages(monkeypatch):
+    engine, scheduler, admission = make_engine(monkeypatch, allocation_policy="on_demand", total_blocks=4)
+    manager = admission.manager
+    engine.submit("A", (1, 2), max_new_tokens=3)
+    assert engine.step() is not None
+    before_blocks = manager.get_request("A").block_ids
+    engine.submit("B", (3, 4), max_new_tokens=1)
+    original = engine.runner._decode_layers
+
+    def fail_after_write(*args, **kwargs):
+        original(*args, **kwargs)
+        assert manager.get_request("A").block_count == 2
+        assert manager.get_request("B").block_count == 1
+        assert manager.get_request("B").pending is not None
+        raise RuntimeError("injected KV append failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(engine.runner, "_decode_layers", fail_after_write)
+        with pytest.raises(RuntimeError, match="injected KV append failure"):
+            engine.step()
+    assert manager.request_ids == ("A",)
+    assert manager.get_request("A").block_ids == before_blocks
+    assert manager.get_request("A").token_count == 2
+    assert manager.allocator.free_count == 3
+    assert scheduler.waiting_request_ids == ("B",)
+    assert engine.step().batch.step_index == 1
+    assert engine.step() is not None
+    assert not scheduler.has_unfinished_requests
+    assert manager.allocator.free_count == 4
 
 
 def test_mixed_step_decode_failure_restores_scheduler_and_new_prefill(

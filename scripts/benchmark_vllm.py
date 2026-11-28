@@ -218,7 +218,7 @@ def load_mini(model: Path, args: argparse.Namespace):
     def new_trial(prefill_backend, chunk_tokens):
         if manager.allocator.free_count != max_blocks:
             raise RuntimeError("previous mini trial left KV blocks allocated")
-        admission = PagedBlockAdmissionController(manager)
+        admission = PagedBlockAdmissionController(manager, allocation_policy=args.mini_kv_allocation_policy)
         scheduler = RequestScheduler(
             max_running_requests=args.max_running_requests,
             max_batch_tokens=args.max_batch_tokens,
@@ -247,6 +247,7 @@ def load_mini(model: Path, args: argparse.Namespace):
 
     return new_trial, {
         "kv_blocks": max_blocks,
+        "kv_allocation_policy": args.mini_kv_allocation_policy,
         "mini_cuda_graph": args.mini_cuda_graph,
         "mini_prefill_cuda_graph": args.mini_prefill_cuda_graph,
     }
@@ -360,6 +361,7 @@ def trial_worker(interpreter: str, backend: str, args: argparse.Namespace):
         "--max-running-requests", str(args.max_running_requests),
         "--max-batch-tokens", str(args.max_batch_tokens),
         "--seed", str(args.seed), "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+        "--mini-kv-allocation-policy", args.mini_kv_allocation_policy,
     ]
     for shape in args.case:
         command.extend(("--case", "x".join(map(str, shape))))
@@ -490,6 +492,8 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.75)
     parser.add_argument("--kv-blocks", type=int,
                         help="Force both backends to use this many 16-token KV blocks")
+    parser.add_argument("--mini-kv-allocation-policy", choices=("lifetime", "on_demand"), default="lifetime",
+                        help="Reserve lifetime pages or allocate from the pool one step at a time")
     parser.add_argument("--ttft-slo-ms", type=float)
     parser.add_argument("--itl-slo-ms", type=float)
     parser.add_argument("--record-tokens", action="store_true",

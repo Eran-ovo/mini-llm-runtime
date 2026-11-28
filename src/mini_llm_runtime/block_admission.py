@@ -1,25 +1,37 @@
-"""Scheduler 与 Paged KV Cache Manager 之间的保守 block 预留策略。"""
+"""Scheduler 与 Paged KV Cache Manager 之间的物理页准入和逐步预算。"""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 from .paged_kv_manager import PagedKVCacheManager
 from .scheduler import RequestState
 
 
+KVAllocationPolicy = Literal["lifetime", "on_demand"]
+
+
 @dataclass(frozen=True)
 class BlockReservation:
+    """请求的生命周期上限；按需模式下实际持页数见 request table。"""
+
     request_id: str
     max_cache_tokens: int
     block_count: int
 
 
 class PagedBlockAdmissionController:
-    """接纳时预留请求最大生命周期容量，避免 Decode 中途 OOM。"""
+    """管理请求的容量上限，以及整段预留或按步分配的策略。"""
 
-    def __init__(self, manager: PagedKVCacheManager) -> None:
+    def __init__(
+        self, manager: PagedKVCacheManager, *, allocation_policy: KVAllocationPolicy = "lifetime"
+    ) -> None:
+        if allocation_policy not in ("lifetime", "on_demand"):
+            raise ValueError("allocation_policy 必须是 lifetime 或 on_demand")
         self.manager = manager
+        self.allocation_policy = allocation_policy
         self._reservations: dict[str, BlockReservation] = {}
 
     @property
@@ -34,10 +46,7 @@ class PagedBlockAdmissionController:
 
     def validate_request_capacity(self, request: RequestState) -> int:
         """校验单条请求能否放入整个 KV 池，返回所需 block 数。"""
-        block_size = self.manager.block_size
-        required_blocks = (
-            request.max_cache_tokens + block_size - 1
-        ) // block_size
+        required_blocks = self._blocks_for(request.max_cache_tokens)
         if required_blocks > self.manager.allocator.total_blocks:
             raise ValueError(
                 f"请求 {request.request_id!r} 永久无法接纳：required_blocks="
@@ -46,20 +55,22 @@ class PagedBlockAdmissionController:
         return required_blocks
 
     def try_admit(self, request: RequestState) -> bool:
-        """资源足够则原子创建 Cache request 并预留，否则无副作用返回 False。"""
+        """注册请求。整段模式同时预留物理页，按需模式建立空表。"""
         if request.request_id in self._reservations:
             raise RuntimeError(f"请求 {request.request_id!r} 已经完成 block 预留")
         required_blocks = self.validate_request_capacity(request)
-        if required_blocks > self.manager.allocator.free_count:
+        reserved_blocks = required_blocks if self.allocation_policy == "lifetime" else 0
+        if reserved_blocks > self.manager.allocator.free_count:
             return False
 
         self.manager.create_request(request.request_id)
         try:
-            new_blocks = self.manager.reserve_request_capacity(
-                request.request_id, request.max_cache_tokens
-            )
-            if len(new_blocks) != required_blocks:
-                raise RuntimeError("新请求预留的 block 数与计算结果不一致")
+            if reserved_blocks:
+                new_blocks = self.manager.reserve_request_capacity(
+                    request.request_id, request.max_cache_tokens
+                )
+                if len(new_blocks) != reserved_blocks:
+                    raise RuntimeError("新请求预留的 block 数与计算结果不一致")
         except Exception:
             # create_request 已进入 registry；任何后续失败都必须恢复 manager。
             self.manager.release_request(request.request_id)
@@ -70,6 +81,57 @@ class PagedBlockAdmissionController:
             block_count=required_blocks,
         )
         return True
+
+    def _blocks_for(self, tokens: int) -> int:
+        block_size = self.manager.block_size
+        return (tokens + block_size - 1) // block_size
+
+    def plan_step(self) -> Callable[[RequestState, int], bool] | None:
+        """只记录本轮拟用页数；真正的分配由各 Adapter 的 begin_append 完成。"""
+        if self.allocation_policy == "lifetime":
+            return None
+
+        held = {}
+        committed = {}
+        limits = {}
+        for reservation in self._reservations.values():
+            request_id = reservation.request_id
+            table = self.manager.get_request(request_id)
+            held[request_id] = table.block_count
+            committed[request_id] = table.token_count
+            limits[request_id] = reservation.block_count
+        free = self.manager.allocator.free_count
+
+        def allow(request: RequestState, token_count: int) -> bool:
+            nonlocal free
+            request_id = request.request_id
+            old = held.get(request_id, 0)
+            target = max(old, self._blocks_for(committed.get(request_id, 0) + token_count))
+            growth = target - old
+            if growth == 0:
+                return True
+            if growth > free:
+                return False
+
+            limit = limits.get(request_id)
+            if limit is None:
+                limit = self.validate_request_capacity(request)
+            rest = [(maximum - held[rid], held[rid]) for rid, maximum in limits.items() if rid != request_id]
+            rest.append((limit - target, target))
+
+            # 先模拟剩余需求最小的请求跑完。完成后的净增空闲量是它当前持有的页。
+            available = free - growth
+            for remaining, owned in sorted(rest):
+                if remaining > available:
+                    return False
+                available += owned
+
+            held[request_id] = target
+            limits[request_id] = limit
+            free -= growth
+            return True
+
+        return allow
 
     def release_finished(
         self, request_ids: tuple[str, ...]

@@ -175,7 +175,8 @@ class ContinuousBatchEngine:
         started_ns = self._clock_ns()
         with _nvtx_range(self.enable_nvtx, "scheduler.schedule_step"):
             batch = self.scheduler.schedule_step(
-                rollback_admissions=self.admission.release_admitted
+                rollback_admissions=self.admission.release_admitted,
+                allow_tokens=self.admission.plan_step(),
             )
         if batch is None:
             return None
@@ -236,7 +237,10 @@ class ContinuousBatchEngine:
                     )
                     emit_rows = tuple(i for i, item in enumerate(prefill_items) if item.emits_token)
                     options = {}
-                    if self.scheduler.prefill_chunk_tokens is not None:
+                    if (
+                        self.scheduler.prefill_chunk_tokens is not None
+                        or self.admission.allocation_policy == "on_demand"
+                    ):
                         options["defer_commit"] = True
                         if len(emit_rows) != len(prefill_items):
                             options["emit_rows"] = emit_rows
